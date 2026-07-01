@@ -28,7 +28,12 @@ from dom_scanner import (
     is_csat_feedback_visible,
     is_telemost_lobby,
 )
-from webrtc_audio import get_capture_status, install_audio_capture, stop_and_save_webrtc_audio
+from webrtc_audio import (
+    ensure_audio_capture,
+    get_capture_status,
+    install_audio_capture,
+    stop_and_save_webrtc_audio,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +96,7 @@ class TelemostRecorder:
         self._meeting_id = self._extract_meeting_id(config.meeting_url)
         self._finalize_done = False
         self._finalize_result: Path | None = None
+        self._webrtc_saved_path: Path | None = None
 
     @staticmethod
     def _extract_meeting_id(meeting_url: str) -> str:
@@ -234,6 +240,7 @@ class TelemostRecorder:
                     if await end_el.count() > 0:
                         for i in range(await end_el.count()):
                             if await end_el.nth(i).is_visible():
+                                await self._on_meeting_end_detected()
                                 return "meeting_ended"
                 except Exception:
                     pass
@@ -246,14 +253,17 @@ class TelemostRecorder:
                     return "signal"
                 if await is_csat_feedback_visible(page):
                     logger.info("Встреча завершена: показан опрос CSAT")
+                    await self._on_meeting_end_detected()
                     return "meeting_ended"
                 reason = await detect_meeting_ended(page)
                 if reason:
                     logger.info("Встреча завершена: %s", reason)
+                    await self._on_meeting_end_detected()
                     return "meeting_ended"
                 if not self._is_still_on_meeting_url():
                     if await is_telemost_lobby(page) or await is_csat_feedback_visible(page):
                         logger.info("Редирект с URL встречи после завершения")
+                        await self._on_meeting_end_detected()
                         return "meeting_ended"
                 await asyncio.sleep(2)
 
@@ -272,6 +282,7 @@ class TelemostRecorder:
                 elif timer_was_visible and timer_visible_since is not None:
                     # Таймер был виден 30+ секунд и исчез — встреча завершена
                     if now - timer_visible_since >= 30:
+                        await self._on_meeting_end_detected()
                         return "meeting_ended"
 
                 await asyncio.sleep(2)
@@ -310,7 +321,36 @@ class TelemostRecorder:
                     task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
+    async def _flush_webrtc_audio(self) -> Path | None:
+        """Срочно сохраняет WebRTC-аудио до навигации на CSAT/лобби."""
+        if self._webrtc_saved_path or not self._page or not self._temp_video_dir:
+            return self._webrtc_saved_path
+
+        path = self._temp_video_dir / "webrtc_audio.webm"
+        try:
+            saved = await stop_and_save_webrtc_audio(self._page, path)
+            if saved:
+                self._webrtc_saved_path = saved
+                logger.info("WebRTC-аудио сохранено досрочно: %s", saved)
+        except Exception as exc:
+            logger.warning("Досрочное сохранение WebRTC-аудио не удалось: %s", exc)
+        return self._webrtc_saved_path
+
+    async def _on_meeting_end_detected(self) -> None:
+        """Вызывается сразу при детекции конца встречи — до смены страницы."""
+        await self._flush_webrtc_audio()
+
     async def _get_video_path(self) -> Path | None:
+        """Получает путь к видеофайлу до закрытия контекста."""
+        if not self._page or not self._page.video:
+            return None
+        try:
+            raw_path = await self._page.video.path()
+            return Path(raw_path) if raw_path else None
+        except Exception as exc:
+            logger.warning("Не удалось получить путь к видео: %s", exc)
+            return None
+
         """Получает путь к видеофайлу до закрытия контекста."""
         if not self._page or not self._page.video:
             return None
@@ -327,27 +367,29 @@ class TelemostRecorder:
             return self._finalize_result
 
         output_path = self._config.output_dir / self._config.output_filename
-        webrtc_webm: Path | None = None
+        webrtc_webm: Path | None = self._webrtc_saved_path
 
-        if self._temp_video_dir:
-            webrtc_webm = self._temp_video_dir / "webrtc_audio.webm"
-
-        # WebRTC-аудио нужно снять ДО закрытия страницы
-        if self._page and webrtc_webm:
+        if not webrtc_webm and self._page and self._temp_video_dir:
             self._status("🎵 Сохранение аудиозаписи...")
+            webrtc_webm = self._temp_video_dir / "webrtc_audio.webm"
             try:
                 saved = await stop_and_save_webrtc_audio(self._page, webrtc_webm)
                 if saved:
                     logger.info("WebRTC WebM сохранён: %s", saved)
+                    self._webrtc_saved_path = saved
+                    webrtc_webm = saved
                 else:
                     status = await get_capture_status(self._page)
                     logger.warning(
-                        "WebRTC-аудио не захвачено (tracks=%s, recorder=%s)",
+                        "WebRTC-аудио не захвачено (tracks=%s, recorder=%s, frames=%s)",
                         status.get("trackCount"),
                         status.get("recorderState"),
+                        status.get("frame", "?"),
                     )
             except Exception as exc:
                 logger.warning("Ошибка сохранения WebRTC-аудио: %s", exc)
+        elif webrtc_webm:
+            logger.info("Используем досрочно сохранённое WebRTC-аудио: %s", webrtc_webm)
 
         video_path: Path | None = None
         try:
@@ -508,6 +550,8 @@ class TelemostRecorder:
             await self._debug_screenshot("after_navigation")
 
             await assert_meeting_not_ended(self._page, phase="navigation")
+            frames = await ensure_audio_capture(self._page)
+            logger.debug("Аудиозахват внедрён в %d фрейм(ов)", frames)
 
             # Даём странице время отрендерить предкомнату
             await asyncio.sleep(2)
@@ -528,14 +572,19 @@ class TelemostRecorder:
             )
             await self._debug_screenshot("after_join")
 
+            frames = await ensure_audio_capture(self._page)
+            logger.info("Аудиозахват после входа: %d фрейм(ов)", frames)
+
             self._status("✅ Подключение к встрече...")
             await self._debug_screenshot("meeting_active")
 
             if self._config.debug:
                 status = await get_capture_status(self._page)
+                installed = status.get("installed", "?")
                 print(
                     f"🎙 Аудиозахват: tracks={status.get('trackCount', 0)}, "
-                    f"recorder={status.get('recorderState', 'none')}",
+                    f"recorder={status.get('recorderState', 'none')}, "
+                    f"hooks={installed}",
                     flush=True,
                 )
 
