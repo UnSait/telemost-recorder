@@ -444,6 +444,8 @@ class TelemostRecorder:
             )
 
             self._page = await self._context.new_page()
+            # Playwright пишет видео с момента создания контекста
+            self._recording_started = True
 
             def on_page_close() -> None:
                 self._page_closed_event.set()
@@ -480,10 +482,7 @@ class TelemostRecorder:
             await self._debug_screenshot("after_join")
 
             self._status("✅ Подключение к встрече...")
-            await asyncio.sleep(3)
             await self._debug_screenshot("meeting_active")
-
-            self._recording_started = True
             self._status("⏺ Запись начата")
 
             reason = await self._wait_for_meeting_end()
@@ -508,11 +507,12 @@ class TelemostRecorder:
 
         except MeetingEndedError as exc:
             await self._debug_screenshot("meeting_ended")
-            if self._recording_started:
-                self._status("⏹ Встреча завершена")
-                audio_path = await self._finalize_recording("meeting_ended")
-                if audio_path:
-                    return audio_path
+            self._status("⏹ Встреча завершена")
+            print(f"⏹ {exc}", flush=True)
+            audio_path = await self._finalize_recording("meeting_ended")
+            if audio_path:
+                print(f"💾 Сохранено: {audio_path}", flush=True)
+                return audio_path
             await self._close_browser()
             raise
         except DomScannerError:

@@ -20,7 +20,7 @@ from recorder import RecorderConfig, TelemostRecorder
 logger = logging.getLogger(__name__)
 
 # Меняйте при каждом релизе — по этой строке видно, что образ пересобран
-BUILD_VERSION = "2026-07-02-csat-v4"
+BUILD_VERSION = "2026-07-02-csat-v5"
 
 TELEMOST_URL_PATTERN = re.compile(r"telemost\.yandex", re.IGNORECASE)
 
@@ -219,12 +219,11 @@ async def run_recorder(args: argparse.Namespace) -> int:
             exit_code = 1
         except MeetingEndedError as exc:
             print(f"⏹ {exc}", flush=True)
-            if exc.phase == "join":
-                print(
-                    "ℹ️ Встреча уже завершена или ссылка недействительна. "
-                    "Запустите бота до окончания встречи.",
-                    flush=True,
-                )
+            print(
+                "ℹ️ Запись не сохранена — встреча завершилась слишком быстро "
+                "или в видео нет аудиодорожки.",
+                flush=True,
+            )
             exit_code = 3
         except AudioExtractionError as exc:
             print(f"❌ Ошибка извлечения аудио: {exc}", flush=True)

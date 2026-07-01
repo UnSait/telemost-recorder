@@ -28,6 +28,11 @@ IN_MEETING_CONTROLS_PATTERN = re.compile(
     r"leave meeting|end meeting",
     re.IGNORECASE,
 )
+# Кнопки микрофона/камеры в UI встречи (в т.ч. «Включить микрофон»)
+MEETING_MEDIA_ARIA_PATTERN = re.compile(
+    r"микрофон|камер|microphone|camera|mute|unmute|video",
+    re.IGNORECASE,
+)
 PREJOIN_JOIN_VISIBLE_PATTERN = re.compile(r"подключиться|присоединиться", re.IGNORECASE)
 WAITING_ROOM_PATTERN = re.compile(
     r"ожидайте|организатор впустит|зал ожидания|waiting room|wait for the host",
@@ -386,6 +391,52 @@ async def _is_prejoin_screen_visible(page: Page) -> bool:
     return False
 
 
+async def _has_meeting_media_controls(page: Page) -> bool:
+    """Кнопки микрофона/камеры по aria-label (иконки без текста в Телемосте)."""
+    buttons = page.locator("button")
+    count = await buttons.count()
+    for i in range(count):
+        try:
+            button = buttons.nth(i)
+            if not await button.is_visible():
+                continue
+            aria = await button.get_attribute("aria-label") or ""
+            if MEETING_MEDIA_ARIA_PATTERN.search(aria):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+async def _is_past_prejoin(page: Page) -> bool:
+    """Предкомната пройдена — нет поля имени и широкой кнопки «Подключиться»."""
+    return not await _is_prejoin_screen_visible(page)
+
+
+async def is_in_active_meeting(page: Page) -> bool:
+    """Проверяет, что бот в зале ожидания или активной встрече (не предкомната/лобби/CSAT)."""
+    if await is_csat_feedback_visible(page) or await is_telemost_lobby(page):
+        return False
+    if await _is_prejoin_screen_visible(page):
+        return False
+    if await _is_waiting_room_visible(page):
+        return True
+    if await _has_meeting_media_controls(page):
+        return True
+    controls = page.get_by_text(IN_MEETING_CONTROLS_PATTERN)
+    if await controls.count() > 0:
+        for i in range(await controls.count()):
+            if await controls.nth(i).is_visible():
+                return True
+    timer = page.get_by_text(re.compile(r"^\d{1,2}:\d{2}(:\d{2})?$"))
+    if await timer.count() > 0:
+        for i in range(await timer.count()):
+            if await timer.nth(i).is_visible():
+                return True
+    # Предкомната ушла, не лобби — вероятно внутри встречи
+    return await _is_past_prejoin(page)
+
+
 async def _is_waiting_room_visible(page: Page) -> bool:
     """Проверяет экран зала ожидания (организатор должен впустить)."""
     waiting = page.get_by_text(WAITING_ROOM_PATTERN)
@@ -446,6 +497,10 @@ async def _wait_for_active_meeting(page: Page, timeout_ms: int = 30_000) -> None
             await asyncio.sleep(1.0)
             continue
 
+        if await is_in_active_meeting(page):
+            logger.info("Вход в встречу подтверждён")
+            return
+
         # Признак 1: кнопки управления внутри встречи (выключить микрофон/камеру)
         controls = page.get_by_text(IN_MEETING_CONTROLS_PATTERN)
         if await controls.count() > 0:
@@ -460,8 +515,7 @@ async def _wait_for_active_meeting(page: Page, timeout_ms: int = 30_000) -> None
                 if await timer.nth(i).is_visible():
                     return
 
-        if saw_waiting_room:
-            # Были в зале ожидания, кнопка подключиться исчезла — вероятно впустили
+        if saw_waiting_room and await _is_past_prejoin(page):
             return
 
         await asyncio.sleep(0.5)
