@@ -20,24 +20,9 @@ from recorder import RecorderConfig, TelemostRecorder
 logger = logging.getLogger(__name__)
 
 # Меняйте при каждом релизе — по этой строке видно, что образ пересобран
-BUILD_VERSION = "2026-07-02-webrtc-audio-v7"
+BUILD_VERSION = "2026-07-02-webrtc-audio-v8"
 
 TELEMOST_URL_PATTERN = re.compile(r"telemost\.yandex", re.IGNORECASE)
-
-
-def parse_video_resolution(value: str) -> tuple[int, int]:
-    """Парсит разрешение видео из формата WIDTHxHEIGHT."""
-    match = re.match(r"^(\d+)x(\d+)$", value.strip())
-    if not match:
-        raise argparse.ArgumentTypeError(
-            f"Некорректное разрешение '{value}'. Ожидается формат: 640x360"
-        )
-    width, height = int(match.group(1)), int(match.group(2))
-    if width < 320 or height < 240 or width > 1920 or height > 1080:
-        raise argparse.ArgumentTypeError(
-            f"Разрешение {width}x{height} вне допустимого диапазона (320x240 — 1920x1080)"
-        )
-    return width, height
 
 
 def validate_meeting_url(url: str) -> str:
@@ -122,12 +107,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Формат выходного аудио (по умолчанию: opus)",
     )
     parser.add_argument(
-        "--video-resolution",
-        type=parse_video_resolution,
-        default=(640, 360),
-        help="Разрешение видеозаписи WIDTHxHEIGHT (по умолчанию: 640x360)",
-    )
-    parser.add_argument(
         "--debug",
         action="store_true",
         help="Отладка: подробные логи, скриншоты, лог DOM-кандидатов (headed только при $DISPLAY)",
@@ -172,7 +151,6 @@ async def run_recorder(args: argparse.Namespace) -> int:
         output_dir=output_dir,
         max_duration=args.max_duration,
         audio_format=args.audio_format,
-        video_resolution=args.video_resolution,
         debug=args.debug,
         output_filename=output_filename,
         on_status=on_status,
@@ -205,7 +183,7 @@ async def run_recorder(args: argparse.Namespace) -> int:
         if audio_path:
             print(f"💾 Частичная запись сохранена: {audio_path}", flush=True)
         else:
-            print("⚠️ Частичная запись не удалась — видеофайл отсутствует", flush=True)
+            print("⚠️ Частичная запись не удалась — WebRTC-аудио отсутствует", flush=True)
 
         sig = received_signal[0] if received_signal else signal.SIGINT
         exit_code = 130 if sig == signal.SIGINT else 143
@@ -221,7 +199,7 @@ async def run_recorder(args: argparse.Namespace) -> int:
             print(f"⏹ {exc}", flush=True)
             print(
                 "ℹ️ Запись не сохранена — встреча завершилась слишком быстро "
-                "или в видео нет аудиодорожки.",
+                "или WebRTC не захватил звук.",
                 flush=True,
             )
             exit_code = 3

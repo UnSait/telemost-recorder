@@ -58,39 +58,38 @@ docker run --rm --ipc=host -v /path/on/host:/app/recordings \
   telemost-recorder "URL" --format mp3
 ```
 
-Или флаг `--output-dir` (путь внутри контейнера, должен совпадать с точкой монтирования volume).
+Или `--output-dir` (путь **внутри контейнера**; при смене флага измените и `-v` слева, чтобы папки совпадали).
 
 ---
 
 ## Примеры запуска
 
+Необязательные флаги (`--format`, `--bot-name`, `--max-duration`, `--debug`) **можно комбинировать в одной команде** — порядок после URL не важен.
+
 ```bash
-# Базовый запуск (аудио в формате Opus)
+# Минимальный запуск: Opus, имя «🤖 AI Ассистент», лимит 4 часа
 docker run --rm --ipc=host -v $(pwd)/recordings:/app/recordings \
   telemost-recorder "https://telemost.yandex.ru/j/1234567890"
 
-# MP3 вместо Opus
+# Типичный запуск: MP3 + своё имя + лимит 1 час
 docker run --rm --ipc=host -v $(pwd)/recordings:/app/recordings \
-  telemost-recorder "https://telemost.yandex.ru/j/1234567890" --format mp3
+  telemost-recorder "https://telemost.yandex.ru/j/1234567890" \
+  --format mp3 \
+  --bot-name "Запись встречи" \
+  --max-duration 3600
 
-# Ограничение длительности — 1 час
-docker run --rm --ipc=host -v $(pwd)/recordings:/app/recordings \
-  telemost-recorder "https://telemost.yandex.ru/j/1234567890" --max-duration 3600
-
-# Режим отладки (скриншоты + лог DOM; на сервере работает в headless)
+# Отладка (скриншоты + лог DOM; на сервере — headless)
 docker run --rm --ipc=host -v $(pwd)/recordings:/app/recordings \
   telemost-recorder "https://telemost.yandex.ru/j/1234567890" --debug \
   2>&1 | tee recordings/last_run.log
-
-# Кастомное имя в списке участников
-docker run --rm --ipc=host -v $(pwd)/recordings:/app/recordings \
-  telemost-recorder "https://telemost.yandex.ru/j/1234567890" \
-  --bot-name "Запись встречи"
-
-# Уменьшенное разрешение видео (меньше RAM; на звук не влияет)
-docker run --rm --ipc=host -v $(pwd)/recordings:/app/recordings \
-  telemost-recorder "https://telemost.yandex.ru/j/1234567890" --video-resolution 480x270
 ```
+
+| Флаг | Что делает |
+|------|------------|
+| `--format mp3` | Сохранить MP3 вместо Opus (по умолчанию) |
+| `--bot-name "…"` | Имя бота в списке участников (видно всем) |
+| `--max-duration 3600` | Остановить запись через N секунд (минимум 60; по умолчанию 14400 = 4 ч) |
+| `--debug` | Подробные логи, скриншоты, строка `Аудиозахват: tracks=…` |
 
 ---
 
@@ -101,9 +100,8 @@ docker run --rm --ipc=host -v $(pwd)/recordings:/app/recordings \
 | `meeting_url` | ✅ | — | HTTPS-ссылка на встречу `telemost.yandex.ru` |
 | `--output-dir` | | `/app/recordings` | Директория для сохранения аудиофайлов |
 | `--bot-name` | | `🤖 AI Ассистент` | Имя, отображаемое в списке участников |
-| `--max-duration` | | `14400` (4 ч) | Максимальная длительность записи в секундах |
+| `--max-duration` | | `14400` (4 ч) | Максимальная длительность записи в секундах (минимум 60) |
 | `--format` | | `opus` | Формат аудио: `opus` или `mp3` |
-| `--video-resolution` | | `640x360` | Разрешение служебной видеозаписи Playwright (RAM) |
 | `--debug` | | выкл. | Подробные логи + скриншоты (на сервере — headless) |
 
 ### Коды выхода
@@ -111,9 +109,9 @@ docker run --rm --ipc=host -v $(pwd)/recordings:/app/recordings \
 | Код | Значение |
 |:---:|---|
 | `0` | Успешная запись |
-| `1` | Общая ошибка (URL, DOM, FFmpeg, браузер) |
+| `1` | Общая ошибка (URL, DOM, FFmpeg, WebRTC `tracks=0`, браузер) |
 | `2` | Встреча требует авторизации |
-| `3` | Встреча уже завершена или недоступна (файл не сохранён) |
+| `3` | Встреча недоступна или завершилась до сохранения аудио (файл не создан) |
 | `130` | Прервано SIGINT (Ctrl+C), частичная запись сохранена |
 | `143` | Прервано SIGTERM, частичная запись сохранена |
 
@@ -130,10 +128,9 @@ flowchart LR
     ffmpeg --> file[recordings/]
 ```
 
-1. **Звук** — перехват WebRTC audio tracks во фреймах Телемоста (`webrtc_audio.py`) → основной результат
-2. **Видео Playwright** — пишется служебно во временную папку (`record_video_dir`), **без звука**; используется только как fallback, если WebRTC не сработал. В `recordings/` попадает **только аудио** (opus/mp3)
-3. **Конец встречи** — текст «Встреча завершена», исчезновение таймера, **опрос CSAT** (звёзды)
-4. **Сохранение** — аудио сбрасывается до навигации на CSAT, затем FFmpeg
+1. **Звук** — перехват WebRTC audio tracks (речь участников) во фреймах Телемоста (`webrtc_audio.py`) → MediaRecorder → временный WebM
+2. **Конец встречи** — текст «Встреча завершена», исчезновение таймера, **опрос CSAT** (звёзды)
+3. **Сохранение** — аудио сбрасывается до навигации на CSAT, затем FFmpeg → `recordings/*.opus` или `*.mp3`
 
 ---
 
@@ -159,7 +156,7 @@ telemost-recorder/
 **Успешный прогон** (фрагмент stdout):
 
 ```
-📦 telemost-recorder 2026-07-02-webrtc-audio-v7
+📦 telemost-recorder 2026-07-02-webrtc-audio-v8
 🔗 Открытие встречи...
 👤 Ввод имени...
 🖱 Нажимаем: 'Подключиться'
@@ -187,7 +184,7 @@ scp user@server:~/telemost-recorder/recordings/*.opus .
 **Очистка:**
 
 ```bash
-rm -f recordings/*.opus recordings/*.mp3 recordings/*.webm
+rm -f recordings/*.opus recordings/*.mp3
 rm -rf recordings/debug_* recordings/last_run.log
 ```
 
@@ -209,33 +206,42 @@ rm -rf recordings/debug_* recordings/last_run.log
 
 Организатор отключил гостевой вход. Бот авторизацию не поддерживает.
 
-### Встреча уже завершена (exit code 3)
+### Встреча недоступна (exit code 3)
+
+Бот не успел войти или встреча закрылась **до сохранения файла** (например, ссылка уже неактивна, CSAT/лобби при открытии страницы):
 
 ```
-⏹ Встреча завершена — показан опрос CSAT
+⏹ Встреча завершена — …
+ℹ️ Запись не сохранена — встреча завершилась слишком быстро или WebRTC не захватил звук.
 ```
 
-Запускайте бота **пока встреча идёт**, с **новой** ссылкой.
+Запускайте бота **пока встреча идёт**, с **актуальной** ссылкой.
 
-### Нет звука в файле (`tracks=0`)
+**Нормальное завершение:** встреча идёт → бот пишет звук → появляется CSAT → файл сохраняется → **exit code 0**.
 
-В debug после входа смотрите:
+### WebRTC не захватил звук (`tracks=0`, exit code 1)
+
+После входа в встречу запустите с `--debug` и проверьте строку:
 
 ```
 🎙 Аудиозахват: tracks=0, recorder=none
 ```
 
-- Встреча без речи в микрофон
-- Бот подключился слишком поздно
-- Нужно говорить в микрофон, чтобы WebRTC отдал дорожки
+Возможные причины:
+
+- Бот подключился до появления участников со звуком
+- Встреча была тихой (никто не говорил)
+- Сменился UI Телемоста / хуки не сработали
 
 При успехе: `tracks≥1`, `recorder=recording`, в конце `💾 Сохранено`.
 
 ### OOM (нехватка памяти)
 
+На слабом VPS задайте лимит памяти Docker и при необходимости уменьшите `--max-duration`:
+
 ```bash
 docker run --rm --ipc=host --memory=1g -v $(pwd)/recordings:/app/recordings \
-  telemost-recorder "URL" --video-resolution 480x270
+  telemost-recorder "URL" --max-duration 3600
 ```
 
 ### Graceful shutdown
@@ -258,7 +264,7 @@ docker run --rm --ipc=host --memory=1g -v $(pwd)/recordings:/app/recordings \
 ## Технический стек
 
 - Python 3.11+
-- Playwright 1.60.0 (async API, `headless=new`)
+- Playwright 1.60.0 (async API, headless Chromium — только навигация и DOM)
 - WebRTC MediaRecorder (in-page audio capture)
 - FFmpeg (WebM → opus/mp3)
 - Docker (`mcr.microsoft.com/playwright/python:v1.60.0-noble`)

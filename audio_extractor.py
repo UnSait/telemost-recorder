@@ -1,4 +1,4 @@
-"""Извлечение аудиодорожки из видеозаписи Playwright через FFmpeg."""
+"""Извлечение аудиодорожки из WebRTC WebM через FFmpeg."""
 
 from __future__ import annotations
 
@@ -22,10 +22,10 @@ async def extract_audio(
     fmt: AudioFormat,
 ) -> Path:
     """
-    Извлекает аудиодорожку из WebM-видео и удаляет исходный файл.
+    Извлекает аудиодорожку из WebM (WebRTC MediaRecorder) и удаляет исходный файл.
 
     Args:
-        video_path: Путь к временному .webm от Playwright.
+        video_path: Путь к временному .webm от WebRTC-захвата.
         output_path: Путь для сохранения аудиофайла.
         fmt: Формат выходного файла — opus (zero-copy) или mp3.
 
