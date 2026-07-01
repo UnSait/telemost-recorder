@@ -13,12 +13,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 RUN playwright install chromium
 
-# Non-root пользователь для безопасности в production
-RUN useradd -m -u 1000 appuser \
-    && mkdir -p /app/recordings \
-    && chown -R appuser:appuser /app
+# В базовом образе Playwright уже есть non-root пользователь pwuser (UID 1000)
+RUN mkdir -p /app/recordings \
+    && chown -R pwuser:pwuser /app
 
-USER appuser
+USER pwuser
 
 VOLUME ["/app/recordings"]
 
