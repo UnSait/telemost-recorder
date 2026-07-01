@@ -217,9 +217,28 @@ async def find_join_button(page: Page) -> Locator | None:
     """
     Ищет кнопку подключения к встрече семантически.
 
-    Приоритет: «Подключиться»/«Присоединиться» с широкой кнопкой;
+    Приоритет: точное совпадение «Подключиться»/«Присоединиться»;
     исключает сайдбарную «Войти» (авторизация).
     """
+    # Самый надёжный путь для Телемоста — кнопка с текстом «Подключиться»
+    for pattern in (
+        re.compile(r"^подключиться$", re.IGNORECASE),
+        re.compile(r"^присоединиться$", re.IGNORECASE),
+        JOIN_PATTERN,
+    ):
+        by_role = page.get_by_role("button", name=pattern)
+        count = await by_role.count()
+        for i in range(count):
+            locator = by_role.nth(i)
+            try:
+                if await locator.is_visible():
+                    info = await _get_element_info(locator)
+                    if not _matches_join_pattern(info):
+                        continue
+                    return locator
+            except Exception:
+                continue
+
     best_locator: Locator | None = None
     best_score = -1
 
@@ -343,6 +362,48 @@ async def _wait_for_active_meeting(page: Page, timeout_ms: int = 30_000) -> None
     )
 
 
+async def _fill_name_field(name_input: Locator, bot_name: str) -> None:
+    """Заполняет имя и проверяет, что значение реально попало в поле."""
+    await name_input.click()
+    await name_input.fill("")
+    await name_input.fill(bot_name)
+
+    value = (await name_input.input_value()).strip()
+    if not value:
+        # Fallback: посимвольный ввод, если React не принял fill()
+        await name_input.press_sequentially(bot_name, delay=40)
+        value = (await name_input.input_value()).strip()
+
+    if not value:
+        raise DomScannerError(
+            "Имя не сохранилось в поле ввода. "
+            "Проверьте скриншот prejoin_room — возможно, поле заблокировано."
+        )
+
+    logger.info("Имя заполнено: %s (в поле: %s)", bot_name, value)
+
+
+async def _click_join_and_wait(page: Page, join_button: Locator) -> None:
+    """Кликает «Подключиться» и ждёт исчезновения кнопки предкомнаты."""
+    join_info = await _get_element_info(join_button)
+    label = join_info.text or join_info.aria_label or "кнопка подключения"
+    print(f"🖱 Нажимаем: {label!r}", flush=True)
+
+    await join_button.scroll_into_view_if_needed()
+    await join_button.click()
+
+    try:
+        await join_button.wait_for(state="hidden", timeout=30_000)
+    except Exception:
+        if await _is_prejoin_screen_visible(page):
+            raise DomScannerError(
+                "Кнопка «Подключиться» осталась на экране после клика. "
+                "Вероятно, имя не принято или нужно действие организатора."
+            ) from None
+
+    logger.info("Кнопка предкомнаты исчезла — переход выполнен")
+
+
 async def fill_name_and_join(
     page: Page,
     bot_name: str,
@@ -367,8 +428,8 @@ async def fill_name_and_join(
     while time.monotonic() < deadline:
         input_candidates = await collect_input_candidates(page)
         if debug:
-            print("🔍 Кандидаты на поле имени:")
-            print(_format_candidates(input_candidates))
+            print("🔍 Кандидаты на поле имени:", flush=True)
+            print(_format_candidates(input_candidates), flush=True)
 
         name_input = await find_name_input(page)
         if name_input is not None:
@@ -390,15 +451,14 @@ async def fill_name_and_join(
             candidates=all_candidates,
         )
 
-    await name_input.fill(bot_name)
-    logger.info("Имя заполнено: %s", bot_name)
+    await _fill_name_field(name_input, bot_name)
 
     join_button: Locator | None = None
     while time.monotonic() < deadline:
         button_candidates = await collect_button_candidates(page)
         if debug:
-            print("🔍 Кандидаты на кнопку подключения:")
-            print(_format_candidates(button_candidates))
+            print("🔍 Кандидаты на кнопку подключения:", flush=True)
+            print(_format_candidates(button_candidates), flush=True)
 
         join_button = await find_join_button(page)
         if join_button is not None:
@@ -420,9 +480,8 @@ async def fill_name_and_join(
             candidates=all_candidates,
         )
 
-    await join_button.click()
-    logger.info("Нажата кнопка подключения")
-    # Даём странице обработать клик и возможный переход в зал ожидания
+    await _click_join_and_wait(page, join_button)
+    # Даём странице обработать переход в зал ожидания или встречу
     await asyncio.sleep(1.0)
 
     try:

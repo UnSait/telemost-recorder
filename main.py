@@ -19,6 +19,9 @@ from recorder import RecorderConfig, TelemostRecorder
 
 logger = logging.getLogger(__name__)
 
+# Меняйте при каждом релизе — по этой строке видно, что образ пересобран
+BUILD_VERSION = "2026-07-02-join-fix-v2"
+
 TELEMOST_URL_PATTERN = re.compile(r"telemost\.yandex", re.IGNORECASE)
 
 
@@ -246,6 +249,8 @@ def main(argv: list[str] | None = None) -> None:
     if args.max_duration < 60:
         print("❌ Ошибка: --max-duration должен быть не менее 60 секунд.")
         sys.exit(1)
+
+    print(f"📦 telemost-recorder {BUILD_VERSION}", flush=True)
 
     try:
         exit_code = asyncio.run(run_recorder(args))
