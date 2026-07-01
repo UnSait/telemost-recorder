@@ -1,15 +1,8 @@
 FROM mcr.microsoft.com/playwright/python:v1.60.0-noble
 
-# FFmpeg для извлечения аудио; системные библиотеки для Chromium в headless
+# FFmpeg для извлечения аудио; зависимости Chromium уже есть в базовом образе Playwright
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
-    libnss3 \
-    libatk-bridge2.0-0 \
-    libcups2 \
-    libdrm2 \
-    libxkbcommon0 \
-    libgbm1 \
-    libasound2 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
