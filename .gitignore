@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Записи и отладочные артефакты
+recordings/
+*.webm
+*.opus
+*.mp3
+debug_*/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
