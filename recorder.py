@@ -25,6 +25,7 @@ from dom_scanner import (
     assert_meeting_not_ended,
     detect_meeting_ended,
     fill_name_and_join,
+    is_csat_feedback_visible,
     is_telemost_lobby,
 )
 
@@ -236,17 +237,21 @@ class TelemostRecorder:
                 await asyncio.sleep(2)
 
         async def wait_meeting_ended_ui() -> str:
-            """Редирект на главную или текст о завершении встречи."""
+            """CSAT, редирект на главную или текст о завершении встречи."""
             while True:
                 if self._shutdown_event.is_set():
                     return "signal"
+                if await is_csat_feedback_visible(page):
+                    logger.info("Встреча завершена: показан опрос CSAT")
+                    return "meeting_ended"
                 reason = await detect_meeting_ended(page)
                 if reason:
                     logger.info("Встреча завершена: %s", reason)
                     return "meeting_ended"
-                if not self._is_still_on_meeting_url() and await is_telemost_lobby(page):
-                    logger.info("Редирект с URL встречи на главную Телемоста")
-                    return "meeting_ended"
+                if not self._is_still_on_meeting_url():
+                    if await is_telemost_lobby(page) or await is_csat_feedback_visible(page):
+                        logger.info("Редирект с URL встречи после завершения")
+                        return "meeting_ended"
                 await asyncio.sleep(2)
 
         async def wait_timer_disappear() -> str:

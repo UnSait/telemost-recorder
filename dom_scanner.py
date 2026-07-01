@@ -41,6 +41,8 @@ MEETING_ENDED_PATTERN = re.compile(
 )
 # Главная Телемоста после завершения или редиректа
 TELEMOST_LOBBY_PATTERN = re.compile(r"создать видеовстречу", re.IGNORECASE)
+# CSAT-опрос после завершения встречи (звёзды + «Закрыть» / «Отправить»)
+CSAT_STAR_ARIA_PATTERN = re.compile(r"выбрать \d из 5 звёзд", re.IGNORECASE)
 
 
 class MeetingEndedError(Exception):
@@ -278,11 +280,43 @@ async def find_join_button(page: Page) -> Locator | None:
     return best_locator
 
 
+async def is_csat_feedback_visible(page: Page) -> bool:
+    """
+    Опрос CSAT после завершения встречи.
+
+    Модалка перекрывает страницу — надёжнее, чем поиск «Создать видеовстречу».
+    """
+    star_buttons = page.get_by_role("button", name=CSAT_STAR_ARIA_PATTERN)
+    if await star_buttons.count() > 0:
+        for i in range(await star_buttons.count()):
+            if await star_buttons.nth(i).is_visible():
+                return True
+
+    buttons = page.locator("button")
+    count = await buttons.count()
+    for i in range(count):
+        try:
+            button = buttons.nth(i)
+            if not await button.is_visible():
+                continue
+            aria = await button.get_attribute("aria-label") or ""
+            if CSAT_STAR_ARIA_PATTERN.search(aria):
+                return True
+        except Exception:
+            continue
+
+    return False
+
+
 async def is_telemost_lobby(page: Page) -> bool:
     """Главная страница Телемоста (после завершения встречи или редиректа)."""
+    if await is_csat_feedback_visible(page):
+        return True
+
     lobby = page.get_by_text(TELEMOST_LOBBY_PATTERN)
     if await lobby.count() == 0:
         return False
+
     for i in range(await lobby.count()):
         if await lobby.nth(i).is_visible():
             return True
@@ -296,6 +330,9 @@ async def detect_meeting_ended(page: Page) -> str | None:
     Returns:
         Текст причины или None, если встреча, похоже, ещё активна.
     """
+    if await is_csat_feedback_visible(page):
+        return "Встреча завершена — показан опрос CSAT (оценка встречи)"
+
     ended = page.get_by_text(MEETING_ENDED_PATTERN)
     if await ended.count() > 0:
         for i in range(await ended.count()):
@@ -428,6 +465,10 @@ async def _wait_for_active_meeting(page: Page, timeout_ms: int = 30_000) -> None
             return
 
         await asyncio.sleep(0.5)
+
+    ended = await detect_meeting_ended(page)
+    if ended:
+        raise MeetingEndedError(ended, phase="join")
 
     raise DomScannerError(
         "Не удалось подтвердить вход в активную встречу за "
@@ -574,6 +615,12 @@ async def fill_name_and_join(
             await _save_debug_artifacts(page, debug_dir, "meeting_ended")
         raise
     except DomScannerError:
+        ended = await detect_meeting_ended(page)
+        if ended:
+            if debug_dir:
+                await _save_debug_artifacts(page, debug_dir, "meeting_ended")
+            raise MeetingEndedError(ended, phase="join") from None
+
         input_candidates = await collect_input_candidates(page)
         button_candidates = await collect_button_candidates(page)
         all_candidates = [c.to_dict() for c in input_candidates + button_candidates]
