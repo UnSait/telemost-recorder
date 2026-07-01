@@ -33,6 +33,22 @@ WAITING_ROOM_PATTERN = re.compile(
     r"ожидайте|организатор впустит|зал ожидания|waiting room|wait for the host",
     re.IGNORECASE,
 )
+MEETING_ENDED_PATTERN = re.compile(
+    r"встреча завершена|meeting ended|встречу завершил|встреча окончена|"
+    r"встреча не найдена|meeting not found|ссылка недействительна|"
+    r"недействительная ссылка|не удалось подключиться к встрече",
+    re.IGNORECASE,
+)
+# Главная Телемоста после завершения или редиректа
+TELEMOST_LOBBY_PATTERN = re.compile(r"создать видеовстречу", re.IGNORECASE)
+
+
+class MeetingEndedError(Exception):
+    """Встреча завершена, недоступна или произошёл редирект с комнаты."""
+
+    def __init__(self, message: str, phase: str = "unknown") -> None:
+        super().__init__(message)
+        self.phase = phase
 
 
 class DomScannerError(Exception):
@@ -262,8 +278,57 @@ async def find_join_button(page: Page) -> Locator | None:
     return best_locator
 
 
+async def is_telemost_lobby(page: Page) -> bool:
+    """Главная страница Телемоста (после завершения встречи или редиректа)."""
+    lobby = page.get_by_text(TELEMOST_LOBBY_PATTERN)
+    if await lobby.count() == 0:
+        return False
+    for i in range(await lobby.count()):
+        if await lobby.nth(i).is_visible():
+            return True
+    return False
+
+
+async def detect_meeting_ended(page: Page) -> str | None:
+    """
+    Проверяет, завершена ли встреча или недоступна.
+
+    Returns:
+        Текст причины или None, если встреча, похоже, ещё активна.
+    """
+    ended = page.get_by_text(MEETING_ENDED_PATTERN)
+    if await ended.count() > 0:
+        for i in range(await ended.count()):
+            if await ended.nth(i).is_visible():
+                text = (await ended.nth(i).inner_text()).strip()
+                return text or "Встреча завершена"
+
+    if await is_telemost_lobby(page):
+        return (
+            "Встреча завершена или недоступна — открылась главная страница Телемоста"
+        )
+
+    return None
+
+
+async def assert_meeting_not_ended(page: Page, phase: str = "unknown") -> None:
+    """Бросает MeetingEndedError, если встреча уже завершена."""
+    reason = await detect_meeting_ended(page)
+    if reason:
+        raise MeetingEndedError(reason, phase=phase)
+
+
 async def _is_prejoin_screen_visible(page: Page) -> bool:
-    """Проверяет, видна ли ещё кнопка «Подключиться» (значит, встреча не начата)."""
+    """Проверяет экран предкомнаты (поле имени или широкая кнопка «Подключиться» внизу)."""
+    name_input = await find_name_input(page)
+    if name_input is not None:
+        try:
+            if await name_input.is_visible():
+                return True
+        except Exception:
+            pass
+
+    # Не путать с плиткой «Подключиться» на главной (160×160) — в предкомнате кнопка широкая
     buttons = page.locator("button")
     count = await buttons.count()
     for i in range(count):
@@ -272,7 +337,12 @@ async def _is_prejoin_screen_visible(page: Page) -> bool:
             if not await button.is_visible():
                 continue
             info = await _get_element_info(button)
-            if PREJOIN_JOIN_VISIBLE_PATTERN.search(info.text):
+            if not PREJOIN_JOIN_VISIBLE_PATTERN.search(info.text):
+                continue
+            bbox = info.bbox or {}
+            width = bbox.get("width", 0)
+            height = bbox.get("height", 0)
+            if width >= 200 and height <= 80:
                 return True
         except Exception:
             continue
@@ -322,7 +392,11 @@ async def _wait_for_active_meeting(page: Page, timeout_ms: int = 30_000) -> None
     saw_waiting_room = False
 
     while time.monotonic() < deadline:
-        # Всё ещё предкомната — кнопка «Подключиться» на месте
+        ended = await detect_meeting_ended(page)
+        if ended:
+            raise MeetingEndedError(ended, phase="join")
+
+        # Всё ещё предкомната — широкая кнопка «Подключиться» или поле имени
         if await _is_prejoin_screen_visible(page):
             await asyncio.sleep(0.5)
             continue
@@ -402,6 +476,11 @@ async def _click_join_and_wait(page: Page, join_button: Locator) -> None:
             ) from None
 
     logger.info("Кнопка предкомнаты исчезла — переход выполнен")
+    await asyncio.sleep(0.5)
+
+    ended = await detect_meeting_ended(page)
+    if ended:
+        raise MeetingEndedError(ended, phase="join")
 
 
 async def fill_name_and_join(
@@ -426,6 +505,10 @@ async def fill_name_and_join(
     name_input: Locator | None = None
 
     while time.monotonic() < deadline:
+        ended = await detect_meeting_ended(page)
+        if ended:
+            raise MeetingEndedError(ended, phase="join")
+
         input_candidates = await collect_input_candidates(page)
         if debug:
             print("🔍 Кандидаты на поле имени:", flush=True)
@@ -486,6 +569,10 @@ async def fill_name_and_join(
 
     try:
         await _wait_for_active_meeting(page, timeout_ms=30_000)
+    except MeetingEndedError:
+        if debug_dir:
+            await _save_debug_artifacts(page, debug_dir, "meeting_ended")
+        raise
     except DomScannerError:
         input_candidates = await collect_input_candidates(page)
         button_candidates = await collect_button_candidates(page)

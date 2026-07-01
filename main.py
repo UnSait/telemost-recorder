@@ -14,13 +14,13 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from audio_extractor import AudioExtractionError
-from dom_scanner import DomScannerError
+from dom_scanner import DomScannerError, MeetingEndedError
 from recorder import RecorderConfig, TelemostRecorder
 
 logger = logging.getLogger(__name__)
 
 # Меняйте при каждом релизе — по этой строке видно, что образ пересобран
-BUILD_VERSION = "2026-07-02-join-fix-v2"
+BUILD_VERSION = "2026-07-02-meeting-end-v3"
 
 TELEMOST_URL_PATTERN = re.compile(r"telemost\.yandex", re.IGNORECASE)
 
@@ -217,6 +217,15 @@ async def run_recorder(args: argparse.Namespace) -> int:
         except DomScannerError as exc:
             print(f"❌ Ошибка поиска элементов предкомнаты:\n{exc}", flush=True)
             exit_code = 1
+        except MeetingEndedError as exc:
+            print(f"⏹ {exc}", flush=True)
+            if exc.phase == "join":
+                print(
+                    "ℹ️ Встреча уже завершена или ссылка недействительна. "
+                    "Запустите бота до окончания встречи.",
+                    flush=True,
+                )
+            exit_code = 3
         except AudioExtractionError as exc:
             print(f"❌ Ошибка извлечения аудио: {exc}", flush=True)
             exit_code = 1

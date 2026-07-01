@@ -14,14 +14,26 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
+from urllib.parse import urlparse
+
 from playwright.async_api import Browser, BrowserContext, Page, Playwright, async_playwright
 
 from audio_extractor import AudioExtractionError, extract_audio
-from dom_scanner import DomScannerError, fill_name_and_join
+from dom_scanner import (
+    DomScannerError,
+    MeetingEndedError,
+    assert_meeting_not_ended,
+    detect_meeting_ended,
+    fill_name_and_join,
+    is_telemost_lobby,
+)
 
 logger = logging.getLogger(__name__)
 
-MEETING_END_PATTERN = re.compile(r"встреча завершена|meeting ended", re.IGNORECASE)
+MEETING_END_PATTERN = re.compile(
+    r"встреча завершена|meeting ended|встречу завершил|встреча окончена",
+    re.IGNORECASE,
+)
 AUTH_PATTERN = re.compile(
     r"логин|login|email|пароль|password|войти в аккаунт|sign in|авториз",
     re.IGNORECASE,
@@ -74,6 +86,19 @@ class TelemostRecorder:
         self._recording_started = False
         self._stop_reason = "normal"
         self._page_closed_event = asyncio.Event()
+        self._meeting_id = self._extract_meeting_id(config.meeting_url)
+
+    @staticmethod
+    def _extract_meeting_id(meeting_url: str) -> str:
+        """Идентификатор встречи из URL для отслеживания редиректов."""
+        path = urlparse(meeting_url).path.rstrip("/")
+        return path.split("/")[-1] if path else ""
+
+    def _is_still_on_meeting_url(self) -> bool:
+        """Проверяет, что вкладка всё ещё на странице встречи."""
+        if not self._page or not self._meeting_id:
+            return True
+        return self._meeting_id in self._page.url
 
     def _status(self, message: str) -> None:
         """Передаёт статусное сообщение в callback (emoji-stdout)."""
@@ -205,9 +230,23 @@ class TelemostRecorder:
                     if await end_el.count() > 0:
                         for i in range(await end_el.count()):
                             if await end_el.nth(i).is_visible():
-                                return "normal"
+                                return "meeting_ended"
                 except Exception:
                     pass
+                await asyncio.sleep(2)
+
+        async def wait_meeting_ended_ui() -> str:
+            """Редирект на главную или текст о завершении встречи."""
+            while True:
+                if self._shutdown_event.is_set():
+                    return "signal"
+                reason = await detect_meeting_ended(page)
+                if reason:
+                    logger.info("Встреча завершена: %s", reason)
+                    return "meeting_ended"
+                if not self._is_still_on_meeting_url() and await is_telemost_lobby(page):
+                    logger.info("Редирект с URL встречи на главную Телемоста")
+                    return "meeting_ended"
                 await asyncio.sleep(2)
 
         async def wait_timer_disappear() -> str:
@@ -225,7 +264,7 @@ class TelemostRecorder:
                 elif timer_was_visible and timer_visible_since is not None:
                     # Таймер был виден 30+ секунд и исчез — встреча завершена
                     if now - timer_visible_since >= 30:
-                        return "normal"
+                        return "meeting_ended"
 
                 await asyncio.sleep(2)
 
@@ -243,6 +282,7 @@ class TelemostRecorder:
 
         tasks = [
             asyncio.create_task(wait_end_text(), name="end_text"),
+            asyncio.create_task(wait_meeting_ended_ui(), name="ended_ui"),
             asyncio.create_task(wait_timer_disappear(), name="timer"),
             asyncio.create_task(wait_page_close(), name="page_close"),
             asyncio.create_task(wait_max_duration(), name="max_duration"),
@@ -413,6 +453,8 @@ class TelemostRecorder:
             )
             await self._debug_screenshot("after_navigation")
 
+            await assert_meeting_not_ended(self._page, phase="navigation")
+
             # Даём странице время отрендерить предкомнату
             await asyncio.sleep(2)
             await self._debug_screenshot("prejoin_room")
@@ -448,6 +490,8 @@ class TelemostRecorder:
                 self._status("⏹ Достигнут лимит длительности записи")
             elif reason == "page_closed":
                 self._status("⏹ Страница встречи закрыта")
+            elif reason == "meeting_ended":
+                self._status("⏹ Встреча завершена")
             else:
                 self._status("⏹ Встреча завершена")
 
@@ -457,6 +501,15 @@ class TelemostRecorder:
 
             return audio_path
 
+        except MeetingEndedError as exc:
+            await self._debug_screenshot("meeting_ended")
+            if self._recording_started:
+                self._status("⏹ Встреча завершена")
+                audio_path = await self._finalize_recording("meeting_ended")
+                if audio_path:
+                    return audio_path
+            await self._close_browser()
+            raise
         except DomScannerError:
             await self._debug_screenshot("dom_error")
             await self._close_browser()
