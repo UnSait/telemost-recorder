@@ -156,7 +156,7 @@ telemost-recorder/
 **Успешный прогон** (фрагмент stdout):
 
 ```
-📦 telemost-recorder 2026-07-02-webrtc-audio-v8
+📦 telemost-recorder 2026-07-02-webrtc-audio-v8.1
 🔗 Открытие встречи...
 👤 Ввод имени...
 🖱 Нажимаем: 'Подключиться'
