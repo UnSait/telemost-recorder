@@ -125,13 +125,13 @@ docker run --rm --ipc=host -v $(pwd)/recordings:/app/recordings \
 flowchart LR
     join[Вход в встречу] --> webrtc[WebRTC захват звука]
     webrtc --> record[MediaRecorder в браузере]
-    record --> end[Конец: CSAT / текст / таймер]
-    end --> ffmpeg[FFmpeg → opus/mp3]
+    record --> meetingEnd[Конец: CSAT / текст / таймер]
+    meetingEnd --> ffmpeg[FFmpeg → opus/mp3]
     ffmpeg --> file[recordings/]
 ```
 
-1. **Звук** — перехват WebRTC audio tracks во фреймах Телемоста (`webrtc_audio.py`)
-2. **Видео Playwright** — только служебное (fallback, обычно без звука)
+1. **Звук** — перехват WebRTC audio tracks во фреймах Телемоста (`webrtc_audio.py`) → основной результат
+2. **Видео Playwright** — пишется служебно во временную папку (`record_video_dir`), **без звука**; используется только как fallback, если WebRTC не сработал. В `recordings/` попадает **только аудио** (opus/mp3)
 3. **Конец встречи** — текст «Встреча завершена», исчезновение таймера, **опрос CSAT** (звёзды)
 4. **Сохранение** — аудио сбрасывается до навигации на CSAT, затем FFmpeg
 
