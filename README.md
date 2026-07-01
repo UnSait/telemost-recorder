@@ -19,7 +19,7 @@ chmod +x deploy.sh
 ./deploy.sh
 
 # 3. Записать встречу
-docker run --rm -v $(pwd)/recordings:/app/recordings telemost-recorder "https://telemost.yandex.ru/j/XXXXXXXX"
+docker run --rm --ipc=host -v $(pwd)/recordings:/app/recordings telemost-recorder "https://telemost.yandex.ru/j/XXXXXXXX"
 ```
 
 ---
@@ -28,28 +28,28 @@ docker run --rm -v $(pwd)/recordings:/app/recordings telemost-recorder "https://
 
 ```bash
 # Базовый запуск (аудио в формате Opus)
-docker run --rm -v $(pwd)/recordings:/app/recordings \
+docker run --rm --ipc=host -v $(pwd)/recordings:/app/recordings \
   telemost-recorder "https://telemost.yandex.ru/j/1234567890"
 
 # MP3 вместо Opus
-docker run --rm -v $(pwd)/recordings:/app/recordings \
+docker run --rm --ipc=host -v $(pwd)/recordings:/app/recordings \
   telemost-recorder "https://telemost.yandex.ru/j/1234567890" --format mp3
 
 # Ограничение длительности — 1 час
-docker run --rm -v $(pwd)/recordings:/app/recordings \
+docker run --rm --ipc=host -v $(pwd)/recordings:/app/recordings \
   telemost-recorder "https://telemost.yandex.ru/j/1234567890" --max-duration 3600
 
 # Режим отладки (headed + скриншоты на каждом шаге)
-docker run --rm -v $(pwd)/recordings:/app/recordings \
+docker run --rm --ipc=host -v $(pwd)/recordings:/app/recordings \
   telemost-recorder "https://telemost.yandex.ru/j/1234567890" --debug
 
 # Кастомное имя в списке участников
-docker run --rm -v $(pwd)/recordings:/app/recordings \
+docker run --rm --ipc=host -v $(pwd)/recordings:/app/recordings \
   telemost-recorder "https://telemost.yandex.ru/j/1234567890" \
   --bot-name "Запись встречи"
 
 # Уменьшенное разрешение видео (меньше RAM)
-docker run --rm -v $(pwd)/recordings:/app/recordings \
+docker run --rm --ipc=host -v $(pwd)/recordings:/app/recordings \
   telemost-recorder "https://telemost.yandex.ru/j/1234567890" --video-resolution 480x270
 ```
 
@@ -132,7 +132,7 @@ rm -rf recordings/debug_*
 Запустите с `--debug` и проверьте скриншоты в `recordings/debug_*`:
 
 ```bash
-docker run --rm -v $(pwd)/recordings:/app/recordings \
+docker run --rm --ipc=host -v $(pwd)/recordings:/app/recordings \
   telemost-recorder "URL" --debug
 ```
 
@@ -154,11 +154,11 @@ Chromium в Docker потребляет 300–800 МБ RAM. Решения:
 
 ```bash
 # Ограничить память контейнера
-docker run --rm --memory=1g -v $(pwd)/recordings:/app/recordings \
+docker run --rm --ipc=host --memory=1g -v $(pwd)/recordings:/app/recordings \
   telemost-recorder "URL" --video-resolution 480x270
 
 # Или уменьшить разрешение видеозаписи
-docker run --rm -v $(pwd)/recordings:/app/recordings \
+docker run --rm --ipc=host -v $(pwd)/recordings:/app/recordings \
   telemost-recorder "URL" --video-resolution 320x240
 ```
 
@@ -177,7 +177,7 @@ ffprobe recordings/partial_*.webm
 `Ctrl+C` или `docker stop` инициируют сохранение частичной записи:
 
 ```bash
-docker run --rm -v $(pwd)/recordings:/app/recordings telemost-recorder "URL"
+docker run --rm --ipc=host -v $(pwd)/recordings:/app/recordings telemost-recorder "URL"
 # В другом терминале: docker stop <container_id>
 ```
 
@@ -199,7 +199,7 @@ docker run --rm -v $(pwd)/recordings:/app/recordings telemost-recorder "URL"
 ## Технический стек
 
 - Python 3.11+
-- Playwright 1.44.0 (async API, `headless=new`)
+- Playwright 1.60.0 (async API, `headless=new`)
 - FFmpeg (системный бинарник)
-- Docker (`mcr.microsoft.com/playwright/python:v1.44.0-noble`)
+- Docker (`mcr.microsoft.com/playwright/python:v1.60.0-noble`)
 - Целевая ОС: Ubuntu Server 22.04/24.04 (без GUI, без X11, без PulseAudio)

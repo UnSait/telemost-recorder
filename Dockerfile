@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/playwright/python:v1.44.0-noble
+FROM mcr.microsoft.com/playwright/python:v1.60.0-noble
 
 # FFmpeg для извлечения аудио; системные библиотеки для Chromium в headless
 RUN apt-get update && apt-get install -y --no-install-recommends \
