@@ -127,7 +127,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--debug",
         action="store_true",
-        help="Режим отладки: headed-браузер + скриншоты на каждом шаге",
+        help="Отладка: подробные логи, скриншоты, лог DOM-кандидатов (headed только при $DISPLAY)",
     )
 
     return parser.parse_args(argv)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import sys
 import tempfile
@@ -26,6 +27,16 @@ AUTH_PATTERN = re.compile(
     re.IGNORECASE,
 )
 TIMER_PATTERN = re.compile(r"^\d{1,2}:\d{2}(:\d{2})?$")
+
+
+def _use_headed_browser(debug: bool) -> bool:
+    """
+    Headed-режим только при наличии X-сервера ($DISPLAY).
+
+    На headless-сервере/Docker --debug включает скриншоты и лог кандидатов,
+    но браузер остаётся headless — иначе Chromium падает без X11.
+    """
+    return debug and bool(os.environ.get("DISPLAY"))
 
 
 @dataclass
@@ -352,6 +363,16 @@ class TelemostRecorder:
 
         try:
             self._playwright = await async_playwright().start()
+            headed = _use_headed_browser(self._config.debug)
+            if self._config.debug and not headed:
+                logger.info(
+                    "DISPLAY не задан — debug работает в headless со скриншотами и логом DOM"
+                )
+                print(
+                    "🔧 Debug: headless + скриншоты (на сервере без X11 headed недоступен)",
+                    flush=True,
+                )
+
             chromium_args = [
                 "--disable-gpu",
                 "--no-sandbox",
@@ -362,11 +383,11 @@ class TelemostRecorder:
                 "--autoplay-policy=no-user-gesture-required",
             ]
             # headless=new — новый режим Chromium без GUI, стабильнее для Docker
-            if not self._config.debug:
+            if not headed:
                 chromium_args.append("--headless=new")
 
             self._browser = await self._playwright.chromium.launch(
-                headless=not self._config.debug,
+                headless=not headed,
                 args=chromium_args,
             )
 

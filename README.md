@@ -39,7 +39,7 @@ docker run --rm --ipc=host -v $(pwd)/recordings:/app/recordings \
 docker run --rm --ipc=host -v $(pwd)/recordings:/app/recordings \
   telemost-recorder "https://telemost.yandex.ru/j/1234567890" --max-duration 3600
 
-# Режим отладки (headed + скриншоты на каждом шаге)
+# Режим отладки (скриншоты + лог DOM; на сервере работает в headless)
 docker run --rm --ipc=host -v $(pwd)/recordings:/app/recordings \
   telemost-recorder "https://telemost.yandex.ru/j/1234567890" --debug
 
@@ -65,7 +65,7 @@ docker run --rm --ipc=host -v $(pwd)/recordings:/app/recordings \
 | `--max-duration` | | `14400` (4 ч) | Максимальная длительность записи в секундах |
 | `--format` | | `opus` | Формат аудио: `opus` или `mp3` |
 | `--video-resolution` | | `640x360` | Разрешение видеозаписи (влияет на RAM) |
-| `--debug` | | выкл. | Headed-режим + скриншоты на каждом шаге |
+| `--debug` | | выкл. | Подробные логи + скриншоты на каждом шаге (на сервере без X11 — headless) |
 
 ### Коды выхода
 
