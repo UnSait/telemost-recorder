@@ -88,6 +88,7 @@ telemost-recorder/
 ├── recorder.py          # TelemostRecorder — Playwright lifecycle
 ├── dom_scanner.py       # Семантический поиск элементов предкомнаты
 ├── audio_extractor.py   # Извлечение аудио через FFmpeg
+├── webrtc_audio.py    # Захват звука встречи через WebRTC/MediaRecorder
 ├── Dockerfile
 ├── requirements.txt
 ├── deploy.sh            # Развёртывание на Ubuntu
@@ -163,15 +164,22 @@ docker run --rm --ipc=host -v $(pwd)/recordings:/app/recordings \
   telemost-recorder "URL" --video-resolution 320x240
 ```
 
-### FFmpeg: нет аудиодорожки в видео
+### Нет аудиодорожки в записи
 
-Playwright WebM на Linux headless может не содержать звук встречи — это ограничение Chromium, а не бага бота. Проверьте наличие аудио:
+Звук захватывается через **WebRTC внутри страницы** (не из видеозаписи Playwright).
 
-```bash
-ffprobe recordings/partial_*.webm
+В debug-режиме после входа смотрите строку:
+```
+🎙 Аудиозахват: tracks=2, recorder=recording
 ```
 
-Если аудиопотока нет — потребуется исследование альтернативных методов захвата звука.
+- `tracks=0` — Телемост не отдал аудиопоток (встреча без звука или UI изменился)
+- `tracks>0` — звук пишется, после завершения должен появиться `.opus`
+
+Проверка файла:
+```bash
+ffprobe recordings/*.opus 2>&1 | grep Audio
+```
 
 ### Graceful shutdown
 

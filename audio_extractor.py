@@ -87,8 +87,8 @@ async def extract_audio(
     if process.returncode != 0:
         if "does not contain any stream" in stderr_text or "no audio streams" in stderr_text.lower():
             raise AudioExtractionError(
-                "В видеозаписи отсутствует аудиодорожка. "
-                "Chromium в headless-режиме мог не захватить звук встречи. "
+                "В записи отсутствует аудиодорожка. "
+                "WebRTC-захват не получил звук встречи (tracks=0). "
                 f"Детали FFmpeg: {stderr_text[-500:]}"
             )
         raise AudioExtractionError(

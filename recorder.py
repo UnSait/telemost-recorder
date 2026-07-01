@@ -28,6 +28,7 @@ from dom_scanner import (
     is_csat_feedback_visible,
     is_telemost_lobby,
 )
+from webrtc_audio import get_capture_status, install_audio_capture, stop_and_save_webrtc_audio
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +89,8 @@ class TelemostRecorder:
         self._stop_reason = "normal"
         self._page_closed_event = asyncio.Event()
         self._meeting_id = self._extract_meeting_id(config.meeting_url)
+        self._finalize_done = False
+        self._finalize_result: Path | None = None
 
     @staticmethod
     def _extract_meeting_id(meeting_url: str) -> str:
@@ -319,9 +322,34 @@ class TelemostRecorder:
             return None
 
     async def _finalize_recording(self, reason: str) -> Path | None:
-        """Закрывает браузер и извлекает аудио из записи."""
-        video_path: Path | None = None
+        """Останавливает WebRTC-запись, закрывает браузер и сохраняет аудио."""
+        if self._finalize_done:
+            return self._finalize_result
 
+        output_path = self._config.output_dir / self._config.output_filename
+        webrtc_webm: Path | None = None
+
+        if self._temp_video_dir:
+            webrtc_webm = self._temp_video_dir / "webrtc_audio.webm"
+
+        # WebRTC-аудио нужно снять ДО закрытия страницы
+        if self._page and webrtc_webm:
+            self._status("🎵 Сохранение аудиозаписи...")
+            try:
+                saved = await stop_and_save_webrtc_audio(self._page, webrtc_webm)
+                if saved:
+                    logger.info("WebRTC WebM сохранён: %s", saved)
+                else:
+                    status = await get_capture_status(self._page)
+                    logger.warning(
+                        "WebRTC-аудио не захвачено (tracks=%s, recorder=%s)",
+                        status.get("trackCount"),
+                        status.get("recorderState"),
+                    )
+            except Exception as exc:
+                logger.warning("Ошибка сохранения WebRTC-аудио: %s", exc)
+
+        video_path: Path | None = None
         try:
             video_path = await self._get_video_path()
         except Exception as exc:
@@ -329,19 +357,36 @@ class TelemostRecorder:
 
         await self._close_browser()
 
+        self._status("🎵 Извлечение аудио...")
+
+        # Приоритет: WebRTC WebM с реальным звуком встречи
+        if webrtc_webm and webrtc_webm.exists() and webrtc_webm.stat().st_size > 0:
+            try:
+                audio_path = await extract_audio(
+                    webrtc_webm,
+                    output_path,
+                    self._config.audio_format,  # type: ignore[arg-type]
+                )
+                self._finalize_done = True
+                self._finalize_result = audio_path
+                return audio_path
+            except AudioExtractionError as exc:
+                logger.error("Ошибка извлечения WebRTC-аудио: %s", exc)
+
+        # Fallback: видеозапись Playwright (обычно без звука)
         if not video_path or not video_path.exists():
-            # Поиск webm во временной директории как fallback
             if self._temp_video_dir and self._temp_video_dir.exists():
-                webm_files = list(self._temp_video_dir.glob("*.webm"))
+                webm_files = [
+                    f for f in self._temp_video_dir.glob("*.webm")
+                    if f.name != "webrtc_audio.webm"
+                ]
                 if webm_files:
                     video_path = webm_files[0]
 
         if not video_path or not video_path.exists():
-            logger.error("Видеозапись не найдена (причина: %s)", reason)
+            logger.error("Аудиозапись не найдена (причина: %s)", reason)
+            self._finalize_done = True
             return None
-
-        output_path = self._config.output_dir / self._config.output_filename
-        self._status("🎵 Извлечение аудио...")
 
         try:
             audio_path = await extract_audio(
@@ -349,10 +394,11 @@ class TelemostRecorder:
                 output_path,
                 self._config.audio_format,  # type: ignore[arg-type]
             )
+            self._finalize_done = True
+            self._finalize_result = audio_path
             return audio_path
         except AudioExtractionError as exc:
-            logger.error("Ошибка извлечения аудио: %s", exc)
-            # Сохраняем видео как частичную запись при ошибке FFmpeg
+            logger.error("Ошибка извлечения аудио из видео: %s", exc)
             partial_path = self._config.output_dir / f"partial_{video_path.name}"
             if not partial_path.exists():
                 try:
@@ -360,6 +406,7 @@ class TelemostRecorder:
                     logger.info("Частичная видеозапись сохранена: %s", partial_path)
                 except OSError:
                     pass
+            self._finalize_done = True
             raise
 
     async def _close_browser(self) -> None:
@@ -439,9 +486,9 @@ class TelemostRecorder:
             self._context = await self._browser.new_context(
                 record_video_dir=str(self._temp_video_dir),
                 record_video_size={"width": width, "height": height},
-                # Разрешаем воспроизведение медиа для захвата звука встречи
                 permissions=["microphone", "camera"],
             )
+            await install_audio_capture(self._context)
 
             self._page = await self._context.new_page()
             # Playwright пишет видео с момента создания контекста
@@ -483,6 +530,15 @@ class TelemostRecorder:
 
             self._status("✅ Подключение к встрече...")
             await self._debug_screenshot("meeting_active")
+
+            if self._config.debug:
+                status = await get_capture_status(self._page)
+                print(
+                    f"🎙 Аудиозахват: tracks={status.get('trackCount', 0)}, "
+                    f"recorder={status.get('recorderState', 'none')}",
+                    flush=True,
+                )
+
             self._status("⏺ Запись начата")
 
             reason = await self._wait_for_meeting_end()
@@ -520,13 +576,12 @@ class TelemostRecorder:
             await self._close_browser()
             raise
         except Exception:
-            # При любой ошибке пытаемся сохранить частичную запись
-            if self._recording_started:
+            if self._recording_started and not self._finalize_done:
                 try:
                     await self._finalize_recording("error")
                 except Exception as partial_exc:
                     logger.warning("Не удалось сохранить частичную запись: %s", partial_exc)
-            else:
+            elif not self._finalize_done:
                 await self._close_browser()
             raise
 
