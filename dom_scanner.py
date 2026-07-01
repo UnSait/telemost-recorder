@@ -16,11 +16,21 @@ logger = logging.getLogger(__name__)
 
 # Паттерны для семантического поиска — централизованы для простой адаптации при смене UI
 NAME_PATTERN = re.compile(r"имя|name|представьтесь|ваше имя", re.IGNORECASE)
-JOIN_PATTERN = re.compile(r"присоединиться|войти|join|enter", re.IGNORECASE)
+# «Подключиться» в Телемосте; намеренно без голого «войти» — это кнопка авторизации в сайдбаре
+JOIN_PATTERN = re.compile(r"подключиться|присоединиться|join|enter", re.IGNORECASE)
+LOGIN_BUTTON_PATTERN = re.compile(r"^(войти|sign in|log in|авториз)", re.IGNORECASE)
 
-# Признаки активной встречи после входа из предкомнаты
-MEETING_ACTIVE_PATTERN = re.compile(
-    r"микрофон|камера|microphone|camera|отключить|выключить|завершить",
+# Признаки активной встречи (НЕ предкомнаты: там «Включить камеру», а не «Выключить»)
+IN_MEETING_CONTROLS_PATTERN = re.compile(
+    r"выключить микрофон|отключить микрофон|"
+    r"выключить камеру|отключить камеру|"
+    r"завершить встречу|покинуть встречу|"
+    r"leave meeting|end meeting",
+    re.IGNORECASE,
+)
+PREJOIN_JOIN_VISIBLE_PATTERN = re.compile(r"подключиться|присоединиться", re.IGNORECASE)
+WAITING_ROOM_PATTERN = re.compile(
+    r"ожидайте|организатор впустит|зал ожидания|waiting room|wait for the host",
     re.IGNORECASE,
 )
 
@@ -126,9 +136,35 @@ def _matches_name_pattern(candidate: ElementCandidate) -> bool:
 
 
 def _matches_join_pattern(candidate: ElementCandidate) -> bool:
-    """Проверяет, подходит ли элемент под паттерн кнопки входа."""
+    """Проверяет, подходит ли элемент под паттерн кнопки входа в встречу."""
     searchable = " ".join(filter(None, [candidate.text, candidate.aria_label]))
+    if LOGIN_BUTTON_PATTERN.search(candidate.aria_label.strip()):
+        return False
+    if LOGIN_BUTTON_PATTERN.search(candidate.text.strip()):
+        return False
     return bool(JOIN_PATTERN.search(searchable))
+
+
+def _join_button_score(candidate: ElementCandidate) -> int:
+    """Чем выше счёт, тем вероятнее это основная кнопка «Подключиться»."""
+    score = 0
+    text = candidate.text.strip()
+    aria = candidate.aria_label.strip()
+
+    if PREJOIN_JOIN_VISIBLE_PATTERN.search(text):
+        score += 100
+    if PREJOIN_JOIN_VISIBLE_PATTERN.search(aria):
+        score += 80
+    if JOIN_PATTERN.search(text) or JOIN_PATTERN.search(aria):
+        score += 40
+
+    width = (candidate.bbox or {}).get("width", 0)
+    if width >= 200:
+        score += 30
+    elif width >= 120:
+        score += 15
+
+    return score
 
 
 async def find_name_input(page: Page) -> Locator | None:
@@ -181,31 +217,12 @@ async def find_join_button(page: Page) -> Locator | None:
     """
     Ищет кнопку подключения к встрече семантически.
 
-    Приоритет: role=button с текстом → aria-label → перебор button.
+    Приоритет: «Подключиться»/«Присоединиться» с широкой кнопкой;
+    исключает сайдбарную «Войти» (авторизация).
     """
-    # Основной путь: button с текстом присоединения
-    buttons_by_role = page.get_by_role("button").filter(has_text=JOIN_PATTERN)
-    if await buttons_by_role.count() > 0:
-        for i in range(await buttons_by_role.count()):
-            locator = buttons_by_role.nth(i)
-            if await locator.is_visible():
-                return locator
+    best_locator: Locator | None = None
+    best_score = -1
 
-    # Fallback: button с aria-label
-    buttons = page.get_by_role("button")
-    count = await buttons.count()
-    for i in range(count):
-        locator = buttons.nth(i)
-        try:
-            if not await locator.is_visible():
-                continue
-            info = await _get_element_info(locator)
-            if _matches_join_pattern(info):
-                return locator
-        except Exception:
-            continue
-
-    # Fallback: перебор всех <button> с проверкой inner_text
     all_buttons = page.locator("button")
     btn_count = await all_buttons.count()
     for i in range(btn_count):
@@ -214,12 +231,44 @@ async def find_join_button(page: Page) -> Locator | None:
             if not await locator.is_visible():
                 continue
             info = await _get_element_info(locator)
-            if _matches_join_pattern(info):
-                return locator
+            if not _matches_join_pattern(info):
+                continue
+            score = _join_button_score(info)
+            if score > best_score:
+                best_score = score
+                best_locator = locator
         except Exception:
             continue
 
-    return None
+    return best_locator
+
+
+async def _is_prejoin_screen_visible(page: Page) -> bool:
+    """Проверяет, видна ли ещё кнопка «Подключиться» (значит, встреча не начата)."""
+    buttons = page.locator("button")
+    count = await buttons.count()
+    for i in range(count):
+        try:
+            button = buttons.nth(i)
+            if not await button.is_visible():
+                continue
+            info = await _get_element_info(button)
+            if PREJOIN_JOIN_VISIBLE_PATTERN.search(info.text):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+async def _is_waiting_room_visible(page: Page) -> bool:
+    """Проверяет экран зала ожидания (организатор должен впустить)."""
+    waiting = page.get_by_text(WAITING_ROOM_PATTERN)
+    if await waiting.count() == 0:
+        return False
+    for i in range(await waiting.count()):
+        if await waiting.nth(i).is_visible():
+            return True
+    return False
 
 
 def _format_candidates(candidates: list[ElementCandidate]) -> str:
@@ -248,33 +297,50 @@ async def _save_debug_artifacts(page: Page, output_dir: Path, prefix: str) -> tu
     return screenshot_path, html_path
 
 
-async def _wait_for_active_meeting(page: Page, timeout_ms: int = 20_000) -> None:
+async def _wait_for_active_meeting(page: Page, timeout_ms: int = 30_000) -> None:
     """Ждёт перехода из предкомнаты в активную встречу."""
     deadline = time.monotonic() + timeout_ms / 1000
+    saw_waiting_room = False
 
     while time.monotonic() < deadline:
-        # Признак 1: элементы управления встречей (микрофон, камера)
-        controls = page.get_by_text(MEETING_ACTIVE_PATTERN)
+        # Всё ещё предкомната — кнопка «Подключиться» на месте
+        if await _is_prejoin_screen_visible(page):
+            await asyncio.sleep(0.5)
+            continue
+
+        if await _is_waiting_room_visible(page):
+            if not saw_waiting_room:
+                print("⏳ Зал ожидания — ждём, пока организатор впустит...", flush=True)
+            saw_waiting_room = True
+            logger.info("Обнаружен зал ожидания — ждём, пока организатор впустит...")
+            await asyncio.sleep(1.0)
+            continue
+
+        # Признак 1: кнопки управления внутри встречи (выключить микрофон/камеру)
+        controls = page.get_by_text(IN_MEETING_CONTROLS_PATTERN)
         if await controls.count() > 0:
             for i in range(await controls.count()):
                 if await controls.nth(i).is_visible():
                     return
 
-        # Признак 2: таймер встречи (формат MM:SS или H:MM:SS)
-        timer = page.get_by_text(re.compile(r"\d{1,2}:\d{2}(:\d{2})?"))
+        # Признак 2: таймер встречи (MM:SS), только если предкомната уже ушла
+        timer = page.get_by_text(re.compile(r"^\d{1,2}:\d{2}(:\d{2})?$"))
         if await timer.count() > 0:
             for i in range(await timer.count()):
                 if await timer.nth(i).is_visible():
                     return
 
-        # Признак 3: исчезновение поля имени
-        name_input = await find_name_input(page)
-        if name_input is None:
+        if saw_waiting_room:
+            # Были в зале ожидания, кнопка подключиться исчезла — вероятно впустили
             return
 
         await asyncio.sleep(0.5)
 
-    raise DomScannerError("Не удалось подтвердить вход в активную встречу за 20 секунд")
+    raise DomScannerError(
+        "Не удалось подтвердить вход в активную встречу за "
+        f"{timeout_ms // 1000} секунд. "
+        "Возможно, организатор не впустил из зала ожидания."
+    )
 
 
 async def fill_name_and_join(
@@ -356,9 +422,11 @@ async def fill_name_and_join(
 
     await join_button.click()
     logger.info("Нажата кнопка подключения")
+    # Даём странице обработать клик и возможный переход в зал ожидания
+    await asyncio.sleep(1.0)
 
     try:
-        await _wait_for_active_meeting(page, timeout_ms=20_000)
+        await _wait_for_active_meeting(page, timeout_ms=30_000)
     except DomScannerError:
         input_candidates = await collect_input_candidates(page)
         button_candidates = await collect_button_candidates(page)
