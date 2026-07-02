@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import base64
 import logging
 from pathlib import Path
 from typing import Any
@@ -10,7 +12,7 @@ from playwright.async_api import BrowserContext, Frame, Page
 
 logger = logging.getLogger(__name__)
 
-# Хуки на prototype + агрегация треков в top-window; stop/status всегда переопределяются
+# Чанки сбрасываются на диск из Python, а не копятся в RAM до конца встречи
 AUDIO_CAPTURE_INIT_SCRIPT = """
 (() => {
   const installHooksOnce = () => {
@@ -140,26 +142,46 @@ AUDIO_CAPTURE_INIT_SCRIPT = """
     };
   };
 
+  window.__telemostDrainAudioChunks = async () => {
+    const cap = getCap();
+    if (!cap.chunks.length) {
+      return { b64: '', byteLength: 0, chunkCount: 0 };
+    }
+
+    const chunks = cap.chunks.splice(0);
+    const mime = (cap.recorder && cap.recorder.mimeType) || 'audio/webm';
+    const blob = new Blob(chunks, { type: mime });
+    const buffer = await blob.arrayBuffer();
+    const bytes = new Uint8Array(buffer);
+
+    let binary = '';
+    for (let i = 0; i < bytes.length; i += 1) {
+      binary += String.fromCharCode(bytes[i]);
+    }
+
+    return {
+      b64: btoa(binary),
+      byteLength: bytes.length,
+      chunkCount: chunks.length,
+    };
+  };
+
   window.__telemostStopAudioCapture = () => new Promise((resolve) => {
     const cap = getCap();
     const recorder = cap.recorder;
 
     if (!recorder || recorder.state === 'inactive') {
       resolve({
-        bytes: [],
-        byteLength: 0,
+        stopped: false,
         trackCount: cap.tracks.size,
         hadRecorder: false,
       });
       return;
     }
 
-    recorder.onstop = async () => {
-      const blob = new Blob(cap.chunks, { type: recorder.mimeType || 'audio/webm' });
-      const buffer = await blob.arrayBuffer();
+    recorder.onstop = () => {
       resolve({
-        bytes: Array.from(new Uint8Array(buffer)),
-        byteLength: buffer.byteLength,
+        stopped: true,
         trackCount: cap.tracks.size,
         hadRecorder: true,
       });
@@ -167,9 +189,13 @@ AUDIO_CAPTURE_INIT_SCRIPT = """
 
     try { recorder.requestData(); } catch (e) { /* ignore */ }
     recorder.stop();
+    cap.recorder = null;
   });
 })();
 """
+
+CHUNK_FLUSH_INTERVAL_SEC = 5
+MIN_WEBM_BYTES = 1000
 
 
 async def install_audio_capture(context: BrowserContext) -> None:
@@ -200,6 +226,28 @@ async def ensure_audio_capture(page: Page) -> int:
     return injected
 
 
+async def _get_best_capture_frame(page: Page) -> Frame:
+    """Фрейм с наибольшим числом треков/чанков — там живёт основной рекордер."""
+    best_frame = page.main_frame
+    best_score = -1
+
+    for frame in page.frames:
+        try:
+            status = await frame.evaluate(
+                "() => window.__telemostAudioCaptureStatus?.() || null"
+            )
+            if not status:
+                continue
+            score = int(status.get("chunkCount", 0)) * 1000 + int(status.get("trackCount", 0))
+            if score > best_score:
+                best_score = score
+                best_frame = frame
+        except Exception:
+            continue
+
+    return best_frame
+
+
 async def get_capture_status(page: Page) -> dict[str, Any]:
     """Возвращает статус in-page аудиорекордера для отладки."""
     best: dict[str, Any] = {}
@@ -217,46 +265,92 @@ async def get_capture_status(page: Page) -> dict[str, Any]:
     return best
 
 
-async def stop_and_save_webrtc_audio(page: Page, output_webm: Path) -> Path | None:
+async def flush_audio_chunks_to_file(page: Page, output_webm: Path) -> int:
     """
-    Останавливает MediaRecorder и сохраняет WebM с аудио.
+    Забирает накопленные чанки из браузера и дописывает их в WebM на диск.
 
-    Пробует все фреймы; выбирает самый большой результат.
+    Освобождает RAM в renderer-процессе Chromium (cap.chunks очищается).
+
+    Returns:
+        Число записанных байт (0, если чанков не было).
+    """
+    frame = await _get_best_capture_frame(page)
+
+    try:
+        result = await frame.evaluate("() => window.__telemostDrainAudioChunks?.()")
+    except Exception as exc:
+        logger.debug("Drain audio chunks: %s", exc)
+        return 0
+
+    if not result:
+        return 0
+
+    b64 = result.get("b64") or ""
+    if not b64:
+        return 0
+
+    data = base64.b64decode(b64)
+    if not data:
+        return 0
+
+    output_webm.parent.mkdir(parents=True, exist_ok=True)
+    with output_webm.open("ab") as handle:
+        handle.write(data)
+
+    nbytes = len(data)
+    logger.debug(
+        "Сброшено %d байт (%d чанков) → %s",
+        nbytes,
+        result.get("chunkCount", 0),
+        output_webm,
+    )
+    return nbytes
+
+
+async def stop_webrtc_recorder(page: Page) -> dict[str, Any]:
+    """Останавливает MediaRecorder без передачи всего файла через Playwright."""
+    for frame in page.frames:
+        try:
+            result = await frame.evaluate("() => window.__telemostStopAudioCapture?.()")
+            if result and result.get("hadRecorder"):
+                return result
+        except Exception as exc:
+            logger.debug("Stop recorder в фрейме %s: %s", frame.url[:60] if frame.url else frame, exc)
+
+    return {"stopped": False, "hadRecorder": False, "trackCount": 0}
+
+
+async def finalize_webrtc_audio(page: Page, output_webm: Path) -> Path | None:
+    """
+    Останавливает рекордер, сбрасывает оставшиеся чанки на диск.
+
+    Файл собирается инкрементально; в Python не держится весь WebM в памяти.
     """
     await ensure_audio_capture(page)
 
-    best_result: dict[str, Any] | None = None
+    stop_info = await stop_webrtc_recorder(page)
+    await asyncio.sleep(0.3)
 
-    for frame in page.frames:
-        try:
-            result = await frame.evaluate(
-                "() => window.__telemostStopAudioCapture?.()"
-            )
-            if not result:
-                continue
-            byte_length = int(result.get("byteLength") or 0)
-            if byte_length > int((best_result or {}).get("byteLength") or 0):
-                best_result = result
-        except Exception as exc:
-            logger.debug("Stop audio в фрейме %s: %s", frame.url[:60] if frame.url else frame, exc)
+    await flush_audio_chunks_to_file(page, output_webm)
+    await flush_audio_chunks_to_file(page, output_webm)
 
-    if not best_result:
-        logger.warning("WebRTC stop: нет результата ни в одном фрейме")
+    if not output_webm.exists():
+        logger.warning(
+            "WebRTC finalize: файл не создан (hadRecorder=%s)",
+            stop_info.get("hadRecorder"),
+        )
         return None
 
-    byte_length = int(best_result.get("byteLength") or 0)
-    raw_bytes = best_result.get("bytes") or []
-
+    size = output_webm.stat().st_size
     logger.info(
-        "WebRTC аудио: tracks=%s, recorder=%s, bytes=%d",
-        best_result.get("trackCount"),
-        best_result.get("hadRecorder"),
-        byte_length,
+        "WebRTC аудио на диске: %s (%d байт, tracks=%s, hadRecorder=%s)",
+        output_webm,
+        size,
+        stop_info.get("trackCount"),
+        stop_info.get("hadRecorder"),
     )
 
-    if byte_length < 1000 or not raw_bytes:
+    if size < MIN_WEBM_BYTES:
         return None
 
-    output_webm.parent.mkdir(parents=True, exist_ok=True)
-    output_webm.write_bytes(bytes(raw_bytes))
     return output_webm

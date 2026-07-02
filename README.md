@@ -89,7 +89,7 @@ docker run --rm --ipc=host -v $(pwd)/recordings:/app/recordings \
 | `--format mp3` | Сохранить MP3 вместо Opus (по умолчанию) |
 | `--bot-name "…"` | Имя бота в списке участников (видно всем) |
 | `--max-duration 3600` | Остановить запись через N секунд (минимум 60; по умолчанию 14400 = 4 ч) |
-| `--debug` | Подробные логи, скриншоты, строка `Аудиозахват: tracks=…` |
+| `--debug` | Подробные логи, скриншоты, `Аудиозахват: tracks=…`, **RAM каждые 30 сек** |
 
 ---
 
@@ -102,7 +102,7 @@ docker run --rm --ipc=host -v $(pwd)/recordings:/app/recordings \
 | `--bot-name` | | `🤖 AI Ассистент` | Имя, отображаемое в списке участников |
 | `--max-duration` | | `14400` (4 ч) | Максимальная длительность записи в секундах (минимум 60) |
 | `--format` | | `opus` | Формат аудио: `opus` или `mp3` |
-| `--debug` | | выкл. | Подробные логи + скриншоты (на сервере — headless) |
+| `--debug` | | выкл. | Подробные логи + скриншоты + мониторинг RAM (на сервере — headless) |
 
 ### Коды выхода
 
@@ -122,15 +122,16 @@ docker run --rm --ipc=host -v $(pwd)/recordings:/app/recordings \
 ```mermaid
 flowchart LR
     join[Вход в встречу] --> webrtc[WebRTC захват звука]
-    webrtc --> record[MediaRecorder в браузере]
-    record --> meetingEnd[Конец: CSAT / текст / таймер]
+    webrtc --> record[MediaRecorder чанки 1 сек]
+    record --> flush[Сброс на диск каждые 5 сек]
+    flush --> meetingEnd[Конец: CSAT / текст / таймер]
     meetingEnd --> ffmpeg[FFmpeg → opus/mp3]
     ffmpeg --> file[recordings/]
 ```
 
-1. **Звук** — перехват WebRTC audio tracks (речь участников) во фреймах Телемоста (`webrtc_audio.py`) → MediaRecorder → временный WebM
+1. **Звук** — перехват WebRTC audio tracks (речь участников) → MediaRecorder → чанки **сбрасываются на диск каждые 5 сек** (RAM не растёт всю встречу)
 2. **Конец встречи** — текст «Встреча завершена», исчезновение таймера, **опрос CSAT** (звёзды)
-3. **Сохранение** — аудио сбрасывается до навигации на CSAT, затем FFmpeg → `recordings/*.opus` или `*.mp3`
+3. **Сохранение** — финальные чанки + FFmpeg → `recordings/*.opus` или `*.mp3`
 
 ---
 
@@ -141,7 +142,8 @@ telemost-recorder/
 ├── main.py              # CLI entry point (argparse)
 ├── recorder.py          # TelemostRecorder — Playwright lifecycle
 ├── dom_scanner.py       # Семантический поиск элементов предкомнаты
-├── webrtc_audio.py      # Захват звука встречи через WebRTC/MediaRecorder
+├── webrtc_audio.py      # WebRTC/MediaRecorder + сброс чанков на диск
+├── resource_monitor.py  # Мониторинг RAM/CPU в --debug
 ├── audio_extractor.py   # Конвертация WebM → opus/mp3 через FFmpeg
 ├── Dockerfile
 ├── requirements.txt
@@ -156,13 +158,14 @@ telemost-recorder/
 **Успешный прогон** (фрагмент stdout):
 
 ```
-📦 telemost-recorder 2026-07-02-webrtc-audio-v8.1
+📦 telemost-recorder 2026-07-02-webrtc-audio-v9
 🔗 Открытие встречи...
 👤 Ввод имени...
 🖱 Нажимаем: 'Подключиться'
 ✅ Подключение к встрече...
 🎙 Аудиозахват: tracks=3, recorder=recording, hooks=True
 ⏺ Запись начата
+📊 RAM: Python 42 MB + Chromium 380 MB = 422 MB | CPU ~8% | процессов 7 | запись на диск ~2 MB
 ⏹ Встреча завершена
 🎵 Извлечение аудио...
 💾 Сохранено: /app/recordings/20260701_231715_53830818664699.opus
@@ -235,9 +238,51 @@ rm -rf recordings/debug_* recordings/last_run.log
 
 При успехе: `tracks≥1`, `recorder=recording`, в конце `💾 Сохранено`.
 
+### Мониторинг RAM (`--debug`)
+
+В режиме `--debug` каждые **30 секунд** в stdout:
+
+```
+📊 RAM: Python 42 MB + Chromium 380 MB = 422 MB | CPU ~8% | процессов 7 | запись на диск ~15 MB
+```
+
+| Что показывает | От чего зависит |
+|----------------|-----------------|
+| **Python MB** | процесс `main.py` |
+| **Chromium MB** | все процессы браузера Playwright |
+| **CPU %** | навигация, WebRTC, сброс чанков |
+| **запись на диск** | накопленный объём сброшенных чанков |
+
+Для бенчмарка на VPS параллельно можно писать `docker stats` (см. ниже).
+
+### Потребление ресурсов (бенчмарк)
+
+> Раздел заполняется после тестовой записи на вашем сервере.
+
+**Как провести объективный тест:**
+
+1. Встреча **15–30 мин** с **живым разговором** (минимум 1 участник говорит).
+2. Бот подключается **пока встреча идёт**.
+3. Запуск **без `--debug`** (базовый RAM) + параллельно:
+
+```bash
+while true; do
+  date -Is
+  docker stats --no-stream --format "{{.MemUsage}} {{.CPUPerc}}" \
+    $(docker ps -q --filter ancestor=telemost-recorder)
+  sleep 10
+done | tee recordings/benchmark_ram.log
+```
+
+4. Лог бота: `docker run ... 2>&1 | tee recordings/benchmark_run.log`
+
+Пришлите логи — цифры (пик RAM, среднее, размер opus/мин) будут добавлены в этот раздел.
+
 ### OOM (нехватка памяти)
 
-На слабом VPS задайте лимит памяти Docker и при необходимости уменьшите `--max-duration`:
+С v9 чанки сбрасываются на диск каждые 5 сек — RAM под запись **не растёт** всю встречу. Основной потребитель — Chromium (~300–500 MB).
+
+На слабом VPS задайте лимит памяти Docker:
 
 ```bash
 docker run --rm --ipc=host --memory=1g -v $(pwd)/recordings:/app/recordings \
@@ -265,7 +310,8 @@ docker run --rm --ipc=host --memory=1g -v $(pwd)/recordings:/app/recordings \
 
 - Python 3.11+
 - Playwright 1.60.0 (async API, headless Chromium — только навигация и DOM)
-- WebRTC MediaRecorder (in-page audio capture)
+- WebRTC MediaRecorder + инкрементальный сброс чанков на диск
+- psutil (мониторинг RAM в `--debug`)
 - FFmpeg (WebM → opus/mp3)
 - Docker (`mcr.microsoft.com/playwright/python:v1.60.0-noble`)
 - Целевая ОС: Ubuntu Server 22.04/24.04 (без GUI)

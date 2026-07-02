@@ -29,11 +29,14 @@ from dom_scanner import (
     is_csat_feedback_visible,
     is_telemost_lobby,
 )
+from resource_monitor import format_snapshot, take_snapshot
 from webrtc_audio import (
+    CHUNK_FLUSH_INTERVAL_SEC,
     ensure_audio_capture,
+    finalize_webrtc_audio,
+    flush_audio_chunks_to_file,
     get_capture_status,
     install_audio_capture,
-    stop_and_save_webrtc_audio,
 )
 
 logger = logging.getLogger(__name__)
@@ -97,6 +100,10 @@ class TelemostRecorder:
         self._finalize_done = False
         self._finalize_result: Path | None = None
         self._webrtc_saved_path: Path | None = None
+        self._webrtc_webm_path: Path | None = None
+        self._chunk_flush_task: asyncio.Task[None] | None = None
+        self._resource_monitor_task: asyncio.Task[None] | None = None
+        self._bytes_flushed = 0
 
     @staticmethod
     def _extract_meeting_id(meeting_url: str) -> str:
@@ -321,14 +328,58 @@ class TelemostRecorder:
                     task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
+    async def _cancel_chunk_flush(self) -> None:
+        """Останавливает фоновый сброс чанков на диск."""
+        if self._chunk_flush_task and not self._chunk_flush_task.done():
+            self._chunk_flush_task.cancel()
+            try:
+                await self._chunk_flush_task
+            except asyncio.CancelledError:
+                pass
+        self._chunk_flush_task = None
+
+    async def _periodic_chunk_flush(self) -> None:
+        """Каждые N секунд сбрасывает WebRTC-чанки из RAM браузера на диск."""
+        try:
+            while not self._shutdown_event.is_set():
+                await asyncio.sleep(CHUNK_FLUSH_INTERVAL_SEC)
+                if self._webrtc_saved_path or not self._page or not self._webrtc_webm_path:
+                    continue
+                nbytes = await flush_audio_chunks_to_file(self._page, self._webrtc_webm_path)
+                if nbytes:
+                    self._bytes_flushed += nbytes
+        except asyncio.CancelledError:
+            pass
+
+    async def _cancel_resource_monitor(self) -> None:
+        """Останавливает периодический вывод RAM в --debug."""
+        if self._resource_monitor_task and not self._resource_monitor_task.done():
+            self._resource_monitor_task.cancel()
+            try:
+                await self._resource_monitor_task
+            except asyncio.CancelledError:
+                pass
+        self._resource_monitor_task = None
+
+    async def _periodic_resource_monitor(self) -> None:
+        """В --debug печатает потребление RAM/CPU каждые 30 секунд."""
+        try:
+            while not self._shutdown_event.is_set():
+                await asyncio.sleep(30)
+                snapshot = take_snapshot()
+                if snapshot:
+                    print(format_snapshot(snapshot), flush=True)
+        except asyncio.CancelledError:
+            pass
+
     async def _flush_webrtc_audio(self) -> Path | None:
-        """Срочно сохраняет WebRTC-аудио до навигации на CSAT/лобби."""
-        if self._webrtc_saved_path or not self._page or not self._temp_dir:
+        """Срочно останавливает запись и сохраняет WebRTC-аудио до навигации на CSAT/лобби."""
+        if self._webrtc_saved_path or not self._page or not self._webrtc_webm_path:
             return self._webrtc_saved_path
 
-        path = self._temp_dir / "webrtc_audio.webm"
         try:
-            saved = await stop_and_save_webrtc_audio(self._page, path)
+            await self._cancel_chunk_flush()
+            saved = await finalize_webrtc_audio(self._page, self._webrtc_webm_path)
             if saved:
                 self._webrtc_saved_path = saved
                 logger.info("WebRTC-аудио сохранено досрочно: %s", saved)
@@ -357,14 +408,16 @@ class TelemostRecorder:
         if self._finalize_done:
             return self._finalize_result
 
+        await self._cancel_chunk_flush()
+        await self._cancel_resource_monitor()
+
         output_path = self._config.output_dir / self._config.output_filename
         webrtc_webm: Path | None = self._webrtc_saved_path
 
-        if not webrtc_webm and self._page and self._temp_dir:
+        if not webrtc_webm and self._page and self._webrtc_webm_path:
             self._status("🎵 Сохранение аудиозаписи...")
-            webrtc_webm = self._temp_dir / "webrtc_audio.webm"
             try:
-                saved = await stop_and_save_webrtc_audio(self._page, webrtc_webm)
+                saved = await finalize_webrtc_audio(self._page, self._webrtc_webm_path)
                 if saved:
                     logger.info("WebRTC WebM сохранён: %s", saved)
                     self._webrtc_saved_path = saved
@@ -372,10 +425,11 @@ class TelemostRecorder:
                 else:
                     status = await get_capture_status(self._page)
                     logger.warning(
-                        "WebRTC-аудио не захвачено (tracks=%s, recorder=%s, frames=%s)",
+                        "WebRTC-аудио не захвачено (tracks=%s, recorder=%s, frames=%s, flushed=%d)",
                         status.get("trackCount"),
                         status.get("recorderState"),
                         status.get("frame", "?"),
+                        self._bytes_flushed,
                     )
             except Exception as exc:
                 logger.warning("Ошибка сохранения WebRTC-аудио: %s", exc)
@@ -448,6 +502,7 @@ class TelemostRecorder:
             self._debug_dir.mkdir(parents=True, exist_ok=True)
 
         self._temp_dir = Path(tempfile.mkdtemp(prefix="telemost_audio_"))
+        self._webrtc_webm_path = self._temp_dir / "webrtc_audio.webm"
 
         try:
             self._playwright = await async_playwright().start()
@@ -512,6 +567,8 @@ class TelemostRecorder:
                 await self._save_auth_artifacts()
                 print("❌ Встреча требует авторизации. Анонимный вход недоступен.")
                 await self._close_browser()
+                await self._cancel_chunk_flush()
+                await self._cancel_resource_monitor()
                 self._cleanup_temp_dir()
                 sys.exit(2)
 
@@ -541,6 +598,14 @@ class TelemostRecorder:
                 )
 
             self._status("⏺ Запись начата")
+            self._chunk_flush_task = asyncio.create_task(self._periodic_chunk_flush())
+            if self._config.debug:
+                snapshot = take_snapshot()
+                if snapshot:
+                    print(format_snapshot(snapshot), flush=True)
+                self._resource_monitor_task = asyncio.create_task(
+                    self._periodic_resource_monitor()
+                )
 
             reason = await self._wait_for_meeting_end()
             self._stop_reason = reason
@@ -571,11 +636,15 @@ class TelemostRecorder:
                 print(f"💾 Сохранено: {audio_path}", flush=True)
                 return audio_path
             await self._close_browser()
+            await self._cancel_chunk_flush()
+            await self._cancel_resource_monitor()
             self._cleanup_temp_dir()
             raise
         except DomScannerError:
             await self._debug_screenshot("dom_error")
             await self._close_browser()
+            await self._cancel_chunk_flush()
+            await self._cancel_resource_monitor()
             self._cleanup_temp_dir()
             raise
         except Exception:
