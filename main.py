@@ -20,7 +20,7 @@ from recorder import RecorderConfig, TelemostRecorder
 logger = logging.getLogger(__name__)
 
 # Меняйте при каждом релизе — по этой строке видно, что образ пересобран
-BUILD_VERSION = "2026-07-02-webrtc-audio-v9"
+BUILD_VERSION = "2026-07-02-webrtc-audio-v9.1"
 
 TELEMOST_URL_PATTERN = re.compile(r"telemost\.yandex", re.IGNORECASE)
 

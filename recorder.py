@@ -29,7 +29,6 @@ from dom_scanner import (
     is_csat_feedback_visible,
     is_telemost_lobby,
 )
-from resource_monitor import format_snapshot, take_snapshot
 from webrtc_audio import (
     CHUNK_FLUSH_INTERVAL_SEC,
     ensure_audio_capture,
@@ -102,7 +101,6 @@ class TelemostRecorder:
         self._webrtc_saved_path: Path | None = None
         self._webrtc_webm_path: Path | None = None
         self._chunk_flush_task: asyncio.Task[None] | None = None
-        self._resource_monitor_task: asyncio.Task[None] | None = None
         self._bytes_flushed = 0
 
     @staticmethod
@@ -351,27 +349,6 @@ class TelemostRecorder:
         except asyncio.CancelledError:
             pass
 
-    async def _cancel_resource_monitor(self) -> None:
-        """Останавливает периодический вывод RAM в --debug."""
-        if self._resource_monitor_task and not self._resource_monitor_task.done():
-            self._resource_monitor_task.cancel()
-            try:
-                await self._resource_monitor_task
-            except asyncio.CancelledError:
-                pass
-        self._resource_monitor_task = None
-
-    async def _periodic_resource_monitor(self) -> None:
-        """В --debug печатает потребление RAM/CPU каждые 30 секунд."""
-        try:
-            while not self._shutdown_event.is_set():
-                await asyncio.sleep(30)
-                snapshot = take_snapshot()
-                if snapshot:
-                    print(format_snapshot(snapshot), flush=True)
-        except asyncio.CancelledError:
-            pass
-
     async def _flush_webrtc_audio(self) -> Path | None:
         """Срочно останавливает запись и сохраняет WebRTC-аудио до навигации на CSAT/лобби."""
         if self._webrtc_saved_path or not self._page or not self._webrtc_webm_path:
@@ -409,7 +386,6 @@ class TelemostRecorder:
             return self._finalize_result
 
         await self._cancel_chunk_flush()
-        await self._cancel_resource_monitor()
 
         output_path = self._config.output_dir / self._config.output_filename
         webrtc_webm: Path | None = self._webrtc_saved_path
@@ -568,7 +544,6 @@ class TelemostRecorder:
                 print("❌ Встреча требует авторизации. Анонимный вход недоступен.")
                 await self._close_browser()
                 await self._cancel_chunk_flush()
-                await self._cancel_resource_monitor()
                 self._cleanup_temp_dir()
                 sys.exit(2)
 
@@ -599,13 +574,6 @@ class TelemostRecorder:
 
             self._status("⏺ Запись начата")
             self._chunk_flush_task = asyncio.create_task(self._periodic_chunk_flush())
-            if self._config.debug:
-                snapshot = take_snapshot()
-                if snapshot:
-                    print(format_snapshot(snapshot), flush=True)
-                self._resource_monitor_task = asyncio.create_task(
-                    self._periodic_resource_monitor()
-                )
 
             reason = await self._wait_for_meeting_end()
             self._stop_reason = reason
@@ -637,14 +605,12 @@ class TelemostRecorder:
                 return audio_path
             await self._close_browser()
             await self._cancel_chunk_flush()
-            await self._cancel_resource_monitor()
             self._cleanup_temp_dir()
             raise
         except DomScannerError:
             await self._debug_screenshot("dom_error")
             await self._close_browser()
             await self._cancel_chunk_flush()
-            await self._cancel_resource_monitor()
             self._cleanup_temp_dir()
             raise
         except Exception:

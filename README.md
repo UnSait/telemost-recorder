@@ -89,7 +89,7 @@ docker run --rm --ipc=host -v $(pwd)/recordings:/app/recordings \
 | `--format mp3` | Сохранить MP3 вместо Opus (по умолчанию) |
 | `--bot-name "…"` | Имя бота в списке участников (видно всем) |
 | `--max-duration 3600` | Остановить запись через N секунд (минимум 60; по умолчанию 14400 = 4 ч) |
-| `--debug` | Подробные логи, скриншоты, `Аудиозахват: tracks=…`, **RAM каждые 30 сек** |
+| `--debug` | Подробные логи, скриншоты, строка `Аудиозахват: tracks=…` |
 
 ---
 
@@ -102,7 +102,7 @@ docker run --rm --ipc=host -v $(pwd)/recordings:/app/recordings \
 | `--bot-name` | | `🤖 AI Ассистент` | Имя, отображаемое в списке участников |
 | `--max-duration` | | `14400` (4 ч) | Максимальная длительность записи в секундах (минимум 60) |
 | `--format` | | `opus` | Формат аудио: `opus` или `mp3` |
-| `--debug` | | выкл. | Подробные логи + скриншоты + мониторинг RAM (на сервере — headless) |
+| `--debug` | | выкл. | Подробные логи + скриншоты (на сервере — headless) |
 
 ### Коды выхода
 
@@ -143,7 +143,6 @@ telemost-recorder/
 ├── recorder.py          # TelemostRecorder — Playwright lifecycle
 ├── dom_scanner.py       # Семантический поиск элементов предкомнаты
 ├── webrtc_audio.py      # WebRTC/MediaRecorder + сброс чанков на диск
-├── resource_monitor.py  # Мониторинг RAM/CPU в --debug
 ├── audio_extractor.py   # Конвертация WebM → opus/mp3 через FFmpeg
 ├── Dockerfile
 ├── requirements.txt
@@ -158,14 +157,13 @@ telemost-recorder/
 **Успешный прогон** (фрагмент stdout):
 
 ```
-📦 telemost-recorder 2026-07-02-webrtc-audio-v9
+📦 telemost-recorder 2026-07-02-webrtc-audio-v9.1
 🔗 Открытие встречи...
 👤 Ввод имени...
 🖱 Нажимаем: 'Подключиться'
 ✅ Подключение к встрече...
 🎙 Аудиозахват: tracks=3, recorder=recording, hooks=True
 ⏺ Запись начата
-📊 RAM: Python 42 MB + Chromium 380 MB = 422 MB | CPU ~8% | процессов 7 | запись на диск ~2 MB
 ⏹ Встреча завершена
 🎵 Извлечение аудио...
 💾 Сохранено: /app/recordings/20260701_231715_53830818664699.opus
@@ -238,62 +236,40 @@ rm -rf recordings/debug_* recordings/last_run.log
 
 При успехе: `tracks≥1`, `recorder=recording`, в конце `💾 Сохранено`.
 
-### Мониторинг RAM (`--debug`)
+### Потребление ресурсов
 
-В режиме `--debug` каждые **30 секунд** в stdout печатается ориентировочная статистика процессов. Для оценки «влезет ли на VPS» ориентируйтесь на **`docker stats`** (см. бенчмарк ниже) — это реальная RAM контейнера.
+Замеры через `docker stats` во время тестовой записи (**v9**, **~21 мин**, `tracks=3`, живой разговор).
 
-### Потребление ресурсов (бенчмарк)
+**Сервер тестирования:**
 
-**Сервер теста** (`achku-swe`):
+| | |
+|--|--|
+| ОС | Ubuntu 26.04 |
+| CPU | 1 core |
+| RAM | 4 GB |
+| Диск | 10 GB NVMe |
 
-| Параметр | Значение |
-|----------|----------|
-| ОС | **Ubuntu 26.04** |
-| CPU | **1 vCPU** |
-| RAM | **4 GB** |
-| Диск | **10 GB NVMe** |
-
-**Прогон от 2026-07-02** — `v9`, встреча **~21 мин**, `tracks=3`, `--format opus`, `--debug`.
+**Один бот (контейнер):**
 
 | Метрика | Значение |
 |---------|----------|
-| **RAM контейнера** (`docker stats`) | пик **345 MiB**, в записи **270–330 MiB**, к концу **~328 MiB** |
-| **CPU** (`docker stats`) | обычно **10–15%** одного ядра, пики до **~43%** |
+| **RAM** | пик **345 MiB**, в записи **270–330 MiB** |
+| **CPU** | обычно **10–15%**, пики до **~43%** |
 | **Файл opus** | **18.3 MB** (~**0.87 MB/мин**) |
-| **Чанки на диск** | ~**80 KB каждые 5 сек** — буфер записи не копится в RAM |
 
-**Вывод для этого сервера (4 GB / 1 vCPU):**
+RAM в записи **не растёт** — чанки сбрасываются на диск каждые 5 сек (v9). На VPS **≥1 GB RAM** на контейнер достаточно с запасом.
 
-- Один бот занимает **~8% RAM** хоста (330 MiB из 4 GB) — большой запас.
-- На **1 ядре** CPU хватает с запасом (пики до 43% при навигации и WebRTC).
-- За **21 мин** на диск ушло **~18 MB** аудио; для 4-часовой встречи ориентир **~200 MB** opus + debug-скриншоты — **10 GB NVMe** более чем достаточно.
-- Лимит `docker run --memory=1g` для одного бота тоже подходит (контейнер ~300 MiB).
-
-> Строки `📊 RAM: Python + Chromium` в `--debug` завышают из‑за суммирования RSS процессов Chromium. Для планирования используйте **`docker stats`**.
-
-**Как повторить тест:**
+Проверить RAM во время записи:
 
 ```bash
-# Терминал 1 — RAM контейнера
-while true; do
-  date -Is
-  docker stats --no-stream --format "{{.MemUsage}} {{.CPUPerc}}" \
-    $(docker ps -q --filter ancestor=telemost-recorder)
-  sleep 10
-done | tee recordings/benchmark_ram.log
-
-# Терминал 2 — запись (15–30 мин, участники говорят)
-docker run --rm --ipc=host -v $(pwd)/recordings:/app/recordings \
-  telemost-recorder "URL" --format opus --max-duration 2100 --debug \
-  2>&1 | tee recordings/benchmark_run.log
+docker stats --no-stream $(docker ps -q --filter ancestor=telemost-recorder)
 ```
-
 
 ### OOM (нехватка памяти)
 
-С v9 чанки сбрасываются на диск каждые 5 сек — RAM под запись **не растёт** всю встречу. На бенчмарке (4 GB / 1 vCPU) контейнер держит **~300 MiB**.
+С v9 чанки сбрасываются на диск каждые 5 сек. По замерам контейнер держит **~300 MiB** RAM; лимит **1 GB** достаточен с запасом.
 
-На VPS с **≤1 GB RAM** задайте лимит Docker:
+На слабом VPS задайте лимит памяти Docker:
 
 ```bash
 docker run --rm --ipc=host --memory=1g -v $(pwd)/recordings:/app/recordings \
@@ -322,7 +298,6 @@ docker run --rm --ipc=host --memory=1g -v $(pwd)/recordings:/app/recordings \
 - Python 3.11+
 - Playwright 1.60.0 (async API, headless Chromium — только навигация и DOM)
 - WebRTC MediaRecorder + инкрементальный сброс чанков на диск
-- psutil (мониторинг RAM в `--debug`)
 - FFmpeg (WebM → opus/mp3)
 - Docker (`mcr.microsoft.com/playwright/python:v1.60.0-noble`)
-- Целевая ОС: Ubuntu Server 22.04/24.04/26.04 (без GUI; бенчмарк — **Ubuntu 26.04**)
+- Целевая ОС: Ubuntu Server 22.04/24.04/26.04 (без GUI)
